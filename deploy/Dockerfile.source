@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# 从本仓库源码编译 nowhere-agent。三个核心不在本仓，不打进这张镜像。
+# 目标机要把核心一并放进镜像时，用同目录的 Dockerfile，在放好四个二进制的目录里构建。
+
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=0.0.0
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION}" \
+    -o /out/nowhere-agent ./cmd/agent
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/nowhere-agent /usr/local/bin/nowhere-agent
+ENV AGENT_RUNTIME=docker \
+    XRAY_BIN=/usr/local/bin/xray \
+    XRAY_API_ADDR=127.0.0.1:10085 \
+    MIHOMO_BIN=/usr/local/bin/mihomo \
+    SINGBOX_BIN=/usr/local/bin/sing-box
+ENTRYPOINT ["/usr/local/bin/nowhere-agent"]

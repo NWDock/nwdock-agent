@@ -1,0 +1,20 @@
+services:
+  agent:
+    image: nowhere-agent:local
+    network_mode: host
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      AGENT_RUNTIME: docker
+      AGENT_DATA_DIR: /var/lib/nowhere-agent
+      AGENT_PANEL_ENDPOINTS: https://panel.example:8089
+      AGENT_PANEL_SPKI_PIN: change-me
+      AGENT_XRAY_BIN: /usr/local/bin/xray
+      AGENT_XRAY_API_ADDR: 127.0.0.1:10085
+      AGENT_MIHOMO_BIN: /usr/local/bin/mihomo
+      AGENT_SINGBOX_BIN: /usr/local/bin/sing-box
+    volumes:
+      - agent-data:/var/lib/nowhere-agent
+
+volumes:
+  agent-data:
