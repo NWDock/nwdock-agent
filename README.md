@@ -30,8 +30,8 @@ docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 
 推送 `v` 开头的 tag（如 `v1.0.1`）才发布。Actions 并行编出三个核心，再打三张镜像，每张只有一个核心：
 
-- `ghcr.io/nwdock/nwdock-agent:<tag>-xray`
-- `ghcr.io/nwdock/nwdock-agent:<tag>-mihomo`
-- `ghcr.io/nwdock/nwdock-agent:<tag>-singbox`
+- `ghcr.io/nwdock/nwdock-agent:xray` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-xray`
+- `ghcr.io/nwdock/nwdock-agent:mihomo` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-mihomo`
+- `ghcr.io/nwdock/nwdock-agent:singbox` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-singbox`
 
 二进制挂到该 tag 的 GitHub Release。`main` 上的提交不触发。sing-box 的 `.srs` 不在镜像里。

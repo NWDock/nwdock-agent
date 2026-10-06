@@ -192,16 +192,19 @@ jobs:
             --build-arg "SINGBOX_TAG=${SINGBOX_TAG}"
             --build-arg "GEO_TAG=${GEO_TAG}"
           )
-          docker build -f deploy/Dockerfile.image "${args[@]}" --target xray -t "${image}:${tag}-xray" image
-          docker build -f deploy/Dockerfile.image "${args[@]}" --target mihomo -t "${image}:${tag}-mihomo" image
-          docker build -f deploy/Dockerfile.image "${args[@]}" --target singbox -t "${image}:${tag}-singbox" image
+          docker build -f deploy/Dockerfile.image "${args[@]}" --target xray -t "${image}:${tag}-xray" -t "${image}:xray" image
+          docker build -f deploy/Dockerfile.image "${args[@]}" --target mihomo -t "${image}:${tag}-mihomo" -t "${image}:mihomo" image
+          docker build -f deploy/Dockerfile.image "${args[@]}" --target singbox -t "${image}:${tag}-singbox" -t "${image}:singbox" image
           docker push "${image}:${tag}-xray"
+          docker push "${image}:xray"
           docker push "${image}:${tag}-mihomo"
+          docker push "${image}:mihomo"
           docker push "${image}:${tag}-singbox"
+          docker push "${image}:singbox"
           {
-            echo "IMAGE_XRAY=${image}:${tag}-xray"
-            echo "IMAGE_MIHOMO=${image}:${tag}-mihomo"
-            echo "IMAGE_SINGBOX=${image}:${tag}-singbox"
+            echo "IMAGE_XRAY=${image}:xray"
+            echo "IMAGE_MIHOMO=${image}:mihomo"
+            echo "IMAGE_SINGBOX=${image}:singbox"
             echo "XRAY_TAG=${XRAY_TAG}"
             echo "MIHOMO_TAG=${MIHOMO_TAG}"
             echo "SINGBOX_TAG=${SINGBOX_TAG}"
