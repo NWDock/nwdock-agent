@@ -5,37 +5,179 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-  packages: write
-
 concurrency:
   group: agent-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  versions:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      xray: ${{ steps.v.outputs.xray }}
+      mihomo: ${{ steps.v.outputs.mihomo }}
+      singbox: ${{ steps.v.outputs.singbox }}
+      geo: ${{ steps.v.outputs.geo }}
     steps:
       - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -a
+          . ./deploy/cores.versions
+          set +a
+          echo "xray=${XRAY_TAG}" >> "$GITHUB_OUTPUT"
+          echo "mihomo=${MIHOMO_TAG}" >> "$GITHUB_OUTPUT"
+          echo "singbox=${SINGBOX_TAG}" >> "$GITHUB_OUTPUT"
+          echo "geo=${GEO_TAG}" >> "$GITHUB_OUTPUT"
 
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-
       - name: Build agent
         env:
           CGO_ENABLED: "0"
         run: |
-          tag="${GITHUB_REF_NAME}"
           go build -trimpath \
-            -ldflags "-X nowhere.local/agent/internal/agent.Version=${tag}" \
+            -ldflags "-X nowhere.local/agent/internal/agent.Version=${GITHUB_REF_NAME}" \
             -o nowhere-agent ./cmd/agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nowhere-agent
+          path: nowhere-agent
+          if-no-files-found: error
 
+  xray:
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ohmycggk/Xray-core
+          ref: ${{ needs.versions.outputs.xray }}
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Build xray
+        working-directory: src
+        env:
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+        run: go build -trimpath -o "$GITHUB_WORKSPACE/xray" ./main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray
+          path: xray
+          if-no-files-found: error
+
+  mihomo:
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ohmycggk/mihomo
+          ref: ${{ needs.versions.outputs.mihomo }}
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Build mihomo
+        working-directory: src
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -tags with_gvisor \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${{ needs.versions.outputs.mihomo }} -w -s -buildid=" \
+            -o "$GITHUB_WORKSPACE/mihomo" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo
+          path: mihomo
+          if-no-files-found: error
+
+  singbox:
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ohmycggk/sing-box
+          ref: ${{ needs.versions.outputs.singbox }}
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+      - name: Build sing-box
+        working-directory: src
+        env:
+          CGO_ENABLED: "0"
+          GOWORK: "off"
+        run: |
+          go build -trimpath \
+            -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" \
+            -o "$GITHUB_WORKSPACE/sing-box" ./cmd/sing-box
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box
+          path: sing-box
+          if-no-files-found: error
+
+  geo:
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download geo
+        env:
+          GEO_TAG: ${{ needs.versions.outputs.geo }}
+        run: |
+          base="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEO_TAG}"
+          curl -fsSL -o geoip.dat "${base}/geoip.dat"
+          curl -fsSL -o geoip.dat.sha256sum "${base}/geoip.dat.sha256sum"
+          curl -fsSL -o geosite.dat "${base}/geosite.dat"
+          curl -fsSL -o geosite.dat.sha256sum "${base}/geosite.dat.sha256sum"
+          sha256sum -c geoip.dat.sha256sum
+          sha256sum -c geosite.dat.sha256sum
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geo
+          path: |
+            geoip.dat
+            geosite.dat
+          if-no-files-found: error
+
+  release:
+    needs: [versions, agent, xray, mihomo, singbox, geo]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: image
+          merge-multiple: true
+      - name: Assemble context
+        run: cp deploy/entrypoint.sh image/entrypoint.sh
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
       - name: Build and push image
         run: |
           set -a
@@ -44,15 +186,14 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           image="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           docker build \
-            -f deploy/Dockerfile.source \
+            -f deploy/Dockerfile.image \
             --build-arg "VERSION=${tag}" \
             --build-arg "XRAY_TAG=${XRAY_TAG}" \
             --build-arg "MIHOMO_TAG=${MIHOMO_TAG}" \
             --build-arg "SINGBOX_TAG=${SINGBOX_TAG}" \
             --build-arg "GEO_TAG=${GEO_TAG}" \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --label "org.opencontainers.image.version=${tag}" \
-            -t "${image}:${tag}" .
+            -t "${image}:${tag}" \
+            image
           docker push "${image}:${tag}"
           {
             echo "IMAGE=${image}:${tag}"
@@ -61,7 +202,6 @@ jobs:
             echo "SINGBOX_TAG=${SINGBOX_TAG}"
             echo "GEO_TAG=${GEO_TAG}"
           } >> "$GITHUB_ENV"
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -71,4 +211,4 @@ jobs:
             --title "${tag}" \
             --notes "$(printf 'nwdock-agent %s\n\nxray %s\nmihomo %s\nsing-box %s\ngeo %s\n\n镜像：%s\n' \
               "${tag}" "${XRAY_TAG}" "${MIHOMO_TAG}" "${SINGBOX_TAG}" "${GEO_TAG}" "${IMAGE}")" \
-            nowhere-agent
+            image/nowhere-agent
