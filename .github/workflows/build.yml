@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: agent-${{ github.workflow }}-${{ github.ref }}
@@ -32,14 +33,21 @@ jobs:
             -ldflags "-X nowhere.local/agent/internal/agent.Version=${tag}" \
             -o nowhere-agent ./cmd/agent
 
-      - name: Build image
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
         run: |
           tag="${GITHUB_REF_NAME}"
+          image="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           docker build \
             -f deploy/Dockerfile.source \
             --build-arg "VERSION=${tag}" \
-            -t "nwdock-agent:${tag}" .
-          docker save "nwdock-agent:${tag}" -o "nwdock-agent-${tag}.tar"
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${tag}" \
+            -t "${image}:${tag}" .
+          docker push "${image}:${tag}"
+          echo "IMAGE=${image}:${tag}" >> "$GITHUB_ENV"
 
       - name: Publish release
         env:
@@ -48,6 +56,5 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           gh release create "${tag}" \
             --title "${tag}" \
-            --notes "nwdock-agent ${tag}" \
-            nowhere-agent \
-            "nwdock-agent-${tag}.tar"
+            --notes "nwdock-agent ${tag}"$'\n\n'"镜像：${IMAGE}" \
+            nowhere-agent

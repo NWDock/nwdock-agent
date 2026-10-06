@@ -20,4 +20,4 @@ docker build -f deploy/Dockerfile.source -t nwdock-agent .
 docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 ```
 
-推送 `v` 开头的 tag（如 `v0.1.0`）才发布。Actions 用 `Dockerfile.source` 编出 `nowhere-agent` 和镜像包，挂到该 tag 的 GitHub Release。`main` 上的提交不触发。
+推送 `v` 开头的 tag（如 `v0.1.0`）才发布。Actions 用 `Dockerfile.source` 编镜像，推到 `ghcr.io/nwdock/nwdock-agent:<tag>`。二进制挂到该 tag 的 GitHub Release。`main` 上的提交不触发。三个核心不在这张镜像里。
