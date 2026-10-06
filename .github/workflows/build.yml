@@ -2,19 +2,18 @@ name: agent
 
 on:
   push:
-    branches: [master, main]
-  pull_request:
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: agent-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  binary:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,35 +27,27 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          version=$(git describe --tags --always --dirty)
+          tag="${GITHUB_REF_NAME}"
           go build -trimpath \
-            -ldflags "-X nowhere.local/agent/internal/agent.Version=${version}" \
+            -ldflags "-X nowhere.local/agent/internal/agent.Version=${tag}" \
             -o nowhere-agent ./cmd/agent
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nowhere-agent-${{ github.sha }}
-          path: nowhere-agent
-          if-no-files-found: error
-
-  image:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
       - name: Build image
         run: |
-          version=$(git describe --tags --always --dirty)
+          tag="${GITHUB_REF_NAME}"
           docker build \
             -f deploy/Dockerfile.source \
-            --build-arg "VERSION=${version}" \
-            -t "nwdock-agent:${{ github.sha }}" .
+            --build-arg "VERSION=${tag}" \
+            -t "nwdock-agent:${tag}" .
+          docker save "nwdock-agent:${tag}" -o "nwdock-agent-${tag}.tar"
 
-      - name: Save image
-        run: docker save "nwdock-agent:${{ github.sha }}" -o nwdock-agent.tar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nwdock-agent-image-${{ github.sha }}
-          path: nwdock-agent.tar
-          if-no-files-found: error
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "${tag}" \
+            --title "${tag}" \
+            --notes "nwdock-agent ${tag}" \
+            nowhere-agent \
+            "nwdock-agent-${tag}.tar"
