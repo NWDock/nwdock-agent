@@ -1,25 +1,95 @@
 # syntax=docker/dockerfile:1
-# 从本仓库源码编译 nowhere-agent。三个核心不在本仓，不打进这张镜像。
-# 目标机要把核心一并放进镜像时，用同目录的 Dockerfile，在放好四个二进制的目录里构建。
+# 构建时按 deploy/cores.versions 拉三个核心的 tag，并放入 Loyalsoldier 的 geoip.dat / geosite.dat。
+# 手工只 COPY 已有二进制时，用同目录的 Dockerfile。
 
-FROM golang:1.26-alpine AS build
+ARG VERSION=0.0.0
+ARG XRAY_TAG=v26.9.9
+ARG MIHOMO_TAG=v1.19.31-nw.1
+ARG SINGBOX_TAG=v1.14.0-alpha.41
+ARG GEO_TAG=202610052207
+
+FROM golang:1.26-alpine AS agent
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=0.0.0
+ARG VERSION
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION}" \
     -o /out/nowhere-agent ./cmd/agent
 
+FROM golang:1.26-alpine AS xray
+RUN apk add --no-cache git
+ARG XRAY_TAG=v26.9.9
+WORKDIR /src
+RUN git clone --depth 1 --branch "${XRAY_TAG}" https://github.com/ohmycggk/Xray-core.git .
+ENV GOWORK=off
+RUN CGO_ENABLED=0 go build -trimpath -o /out/xray ./main
+
+FROM golang:1.26-alpine AS mihomo
+RUN apk add --no-cache git
+ARG MIHOMO_TAG=v1.19.31-nw.1
+WORKDIR /src
+RUN git clone --depth 1 --branch "${MIHOMO_TAG}" https://github.com/ohmycggk/mihomo.git .
+ENV GOWORK=off
+RUN CGO_ENABLED=0 go build -trimpath -tags with_gvisor \
+    -ldflags "-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_TAG} -w -s -buildid=" \
+    -o /out/mihomo .
+
+FROM golang:1.26-alpine AS singbox
+RUN apk add --no-cache git
+ARG SINGBOX_TAG=v1.14.0-alpha.41
+WORKDIR /src
+RUN git clone --depth 1 --branch "${SINGBOX_TAG}" https://github.com/ohmycggk/sing-box.git .
+ENV GOWORK=off
+RUN CGO_ENABLED=0 go build -trimpath \
+    -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" \
+    -o /out/sing-box ./cmd/sing-box
+
+FROM debian:bookworm-slim AS geo
+ARG GEO_TAG=202610052207
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /out
+RUN curl -fsSL -o geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEO_TAG}/geoip.dat" \
+    && curl -fsSL -o geoip.dat.sha256sum "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEO_TAG}/geoip.dat.sha256sum" \
+    && curl -fsSL -o geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEO_TAG}/geosite.dat" \
+    && curl -fsSL -o geosite.dat.sha256sum "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${GEO_TAG}/geosite.dat.sha256sum" \
+    && sha256sum -c geoip.dat.sha256sum \
+    && sha256sum -c geosite.dat.sha256sum
+
 FROM debian:bookworm-slim
+ARG VERSION=0.0.0
+ARG XRAY_TAG=v26.9.9
+ARG MIHOMO_TAG=v1.19.31-nw.1
+ARG SINGBOX_TAG=v1.14.0-alpha.41
+ARG GEO_TAG=202610052207
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=build /out/nowhere-agent /usr/local/bin/nowhere-agent
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/share/nowhere /var/lib/nowhere-agent
+COPY --from=agent /out/nowhere-agent /usr/local/bin/nowhere-agent
+COPY --from=xray /out/xray /usr/local/bin/xray
+COPY --from=mihomo /out/mihomo /usr/local/bin/mihomo
+COPY --from=singbox /out/sing-box /usr/local/bin/sing-box
+COPY --from=geo /out/geoip.dat /out/geosite.dat /usr/share/nowhere/
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh \
+    && printf 'xray=%s\nmihomo=%s\nsing-box=%s\ngeo=%s\nagent=%s\n' \
+        "${XRAY_TAG}" "${MIHOMO_TAG}" "${SINGBOX_TAG}" "${GEO_TAG}" "${VERSION}" \
+        > /usr/share/nowhere/cores.txt
+LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision.xray="${XRAY_TAG}" \
+      org.opencontainers.image.revision.mihomo="${MIHOMO_TAG}" \
+      org.opencontainers.image.revision.sing-box="${SINGBOX_TAG}" \
+      org.opencontainers.image.revision.geo="${GEO_TAG}"
 ENV AGENT_RUNTIME=docker \
+    AGENT_DATA_DIR=/var/lib/nowhere-agent \
     XRAY_BIN=/usr/local/bin/xray \
     XRAY_API_ADDR=127.0.0.1:10085 \
     MIHOMO_BIN=/usr/local/bin/mihomo \
     SINGBOX_BIN=/usr/local/bin/sing-box
-ENTRYPOINT ["/usr/local/bin/nowhere-agent"]
+VOLUME ["/var/lib/nowhere-agent"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

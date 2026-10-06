@@ -38,16 +38,29 @@ jobs:
 
       - name: Build and push image
         run: |
+          set -a
+          . ./deploy/cores.versions
+          set +a
           tag="${GITHUB_REF_NAME}"
           image="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           docker build \
             -f deploy/Dockerfile.source \
             --build-arg "VERSION=${tag}" \
+            --build-arg "XRAY_TAG=${XRAY_TAG}" \
+            --build-arg "MIHOMO_TAG=${MIHOMO_TAG}" \
+            --build-arg "SINGBOX_TAG=${SINGBOX_TAG}" \
+            --build-arg "GEO_TAG=${GEO_TAG}" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${tag}" \
             -t "${image}:${tag}" .
           docker push "${image}:${tag}"
-          echo "IMAGE=${image}:${tag}" >> "$GITHUB_ENV"
+          {
+            echo "IMAGE=${image}:${tag}"
+            echo "XRAY_TAG=${XRAY_TAG}"
+            echo "MIHOMO_TAG=${MIHOMO_TAG}"
+            echo "SINGBOX_TAG=${SINGBOX_TAG}"
+            echo "GEO_TAG=${GEO_TAG}"
+          } >> "$GITHUB_ENV"
 
       - name: Publish release
         env:
@@ -56,5 +69,6 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           gh release create "${tag}" \
             --title "${tag}" \
-            --notes "nwdock-agent ${tag}"$'\n\n'"镜像：${IMAGE}" \
+            --notes "$(printf 'nwdock-agent %s\n\nxray %s\nmihomo %s\nsing-box %s\ngeo %s\n\n镜像：%s\n' \
+              "${tag}" "${XRAY_TAG}" "${MIHOMO_TAG}" "${SINGBOX_TAG}" "${GEO_TAG}" "${IMAGE}")" \
             nowhere-agent
