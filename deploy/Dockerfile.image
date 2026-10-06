@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
-# 组装已编好的二进制和 geo。三个核心由工作流并行编出，不在这一步编译。
+# 三个 target，各打一个镜像标签，里面只有一个核心。
+# docker build --target xray|mihomo|singbox
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS base
 ARG VERSION=0.0.0
 ARG XRAY_TAG=
 ARG MIHOMO_TAG=
@@ -11,19 +12,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /usr/share/nowhere /var/lib/nowhere-agent
-COPY nowhere-agent xray mihomo sing-box /usr/local/bin/
+COPY nowhere-agent /usr/local/bin/nowhere-agent
 COPY geoip.dat geosite.dat /usr/share/nowhere/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/nowhere-agent /usr/local/bin/xray /usr/local/bin/mihomo /usr/local/bin/sing-box \
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/nowhere-agent \
     && printf 'xray=%s\nmihomo=%s\nsing-box=%s\ngeo=%s\nagent=%s\n' \
         "${XRAY_TAG}" "${MIHOMO_TAG}" "${SINGBOX_TAG}" "${GEO_TAG}" "${VERSION}" \
         > /usr/share/nowhere/cores.txt
-LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision.xray="${XRAY_TAG}" \
-      org.opencontainers.image.revision.mihomo="${MIHOMO_TAG}" \
-      org.opencontainers.image.revision.sing-box="${SINGBOX_TAG}" \
-      org.opencontainers.image.revision.geo="${GEO_TAG}"
 ENV AGENT_RUNTIME=docker \
     AGENT_DATA_DIR=/var/lib/nowhere-agent \
     XRAY_BIN=/usr/local/bin/xray \
@@ -32,3 +27,39 @@ ENV AGENT_RUNTIME=docker \
     SINGBOX_BIN=/usr/local/bin/sing-box
 VOLUME ["/var/lib/nowhere-agent"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+FROM base AS xray
+ARG VERSION=0.0.0
+ARG XRAY_TAG=
+ARG GEO_TAG=
+COPY xray /usr/local/bin/xray
+RUN chmod 755 /usr/local/bin/xray
+LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="nwdock-agent-xray" \
+      org.opencontainers.image.revision.xray="${XRAY_TAG}" \
+      org.opencontainers.image.revision.geo="${GEO_TAG}"
+
+FROM base AS mihomo
+ARG VERSION=0.0.0
+ARG MIHOMO_TAG=
+ARG GEO_TAG=
+COPY mihomo /usr/local/bin/mihomo
+RUN chmod 755 /usr/local/bin/mihomo
+LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="nwdock-agent-mihomo" \
+      org.opencontainers.image.revision.mihomo="${MIHOMO_TAG}" \
+      org.opencontainers.image.revision.geo="${GEO_TAG}"
+
+FROM base AS singbox
+ARG VERSION=0.0.0
+ARG SINGBOX_TAG=
+ARG GEO_TAG=
+COPY sing-box /usr/local/bin/sing-box
+RUN chmod 755 /usr/local/bin/sing-box
+LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="nwdock-agent-singbox" \
+      org.opencontainers.image.revision.sing-box="${SINGBOX_TAG}" \
+      org.opencontainers.image.revision.geo="${GEO_TAG}"
