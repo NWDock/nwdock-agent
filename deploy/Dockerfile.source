@@ -18,7 +18,8 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION}" \
     -o /out/nowhere-agent ./cmd/agent
 
-FROM golang:1.26-alpine AS xray
+# v26.9.9 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
+FROM golang:1.27-alpine AS xray
 RUN apk add --no-cache git
 ARG XRAY_TAG=v26.9.9
 WORKDIR /src
