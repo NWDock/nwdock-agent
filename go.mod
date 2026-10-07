@@ -2,7 +2,10 @@ module nowhere.local/agent
 
 go 1.26.0
 
-require google.golang.org/grpc v1.84.0
+require (
+	github.com/coder/websocket v1.8.14
+	google.golang.org/grpc v1.84.0
+)
 
 require (
 	golang.org/x/net v0.57.0 // indirect

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -47,11 +46,13 @@ const assetMaxBytes int64 = 64 << 20
 type geoDesired struct {
 	Name   string `json:"name"`
 	SHA256 string `json:"sha256"`
+	Token  string `json:"token"`
 }
 
 type ruleSetDesired struct {
 	Name   string `json:"name"`
 	SHA256 string `json:"sha256"`
+	Token  string `json:"token"`
 }
 
 // validAssetName 只接受两类资产：xray/mihomo 的 .dat 与 sing-box 的 <tag>.srs 规则集。
@@ -80,7 +81,7 @@ func assetSidecar(name string) string {
 }
 
 // syncAssets 让本地资产与面板清单一致；返回是否有文件更新（核心只在启动时加载 geo/规则集，需重启）。
-func syncAssets(ctx context.Context, cfg Config, cert tls.Certificate, entries []geoDesired) (bool, error) {
+func syncAssets(ctx context.Context, cfg Config, entries []geoDesired) (bool, error) {
 	changed := false
 	for _, entry := range entries {
 		if !validAssetName(entry.Name) {
@@ -93,7 +94,7 @@ func syncAssets(ctx context.Context, cfg Config, cert tls.Certificate, entries [
 		if have, err := os.ReadFile(filepath.Join(cfg.DataDir, assetSidecar(entry.Name))); err == nil && strings.TrimSpace(string(have)) == want {
 			continue
 		}
-		data, err := fetchAsset(ctx, cfg, cert, entry.Name)
+		data, err := fetchAsset(ctx, cfg, entry)
 		if err != nil {
 			return changed, err
 		}
@@ -123,17 +124,21 @@ func syncAssets(ctx context.Context, cfg Config, cert tls.Certificate, entries [
 
 func assetFetchPath(name string) string {
 	if strings.HasSuffix(name, ".srs") {
-		return "/api/agent/rule-sets/" + name
+		return "/api/agent/files/rule-sets/" + name
 	}
-	return "/api/agent/geo/" + name
+	return "/api/agent/files/geo/" + name
 }
 
-func fetchAsset(ctx context.Context, cfg Config, cert tls.Certificate, name string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Endpoints[0]+assetFetchPath(name), nil)
+// assetClient 复用连接；大 geo 文件放宽超时，sha256 校验仍兜底。
+var assetClient = &http.Client{Timeout: 5 * time.Minute}
+
+func fetchAsset(ctx context.Context, cfg Config, entry geoDesired) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, channelHTTPBase(cfg.Endpoints[0])+assetFetchPath(entry.Name), nil)
 	if err != nil {
 		return nil, err
 	}
-	res, err := httpClient(cfg.Pin, cert).Do(req)
+	req.Header.Set("Authorization", "AgentFile "+entry.Token)
+	res, err := assetClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("asset fetch: %w", err)
 	}
@@ -153,19 +158,9 @@ func coreEnv(kind coreKind, dir string) []string {
 	return env
 }
 
-func syncConfig(ctx context.Context, cfg Config) error {
+// applyDesired 应用面板经加密通道推送的 desired 载荷（现 desired 端点响应原样）。
+func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	api := coreAPIAddr()
-	cert, err := tls.LoadX509KeyPair(filepath.Join(cfg.DataDir, "agent.crt"), filepath.Join(cfg.DataDir, "agent.key"))
-	if err != nil {
-		return err
-	}
-	res, err := httpNew(ctx, cfg.Endpoints[0]+"/api/agent/desired?api="+api, cert, cfg.Pin)
-	if err != nil {
-		return err
-	}
-	if res.status != 200 {
-		return fmt.Errorf("desired status %d", res.status)
-	}
 	var body struct {
 		Generation int              `json:"generation"`
 		Serving    bool             `json:"serving"`
@@ -176,18 +171,18 @@ func syncConfig(ctx context.Context, cfg Config) error {
 		Geo        []geoDesired     `json:"geo"`
 		RuleSets   []ruleSetDesired `json:"rule_sets"`
 	}
-	if err := json.Unmarshal(res.body, &body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return err
 	}
 	want := normalizeCore(body.Core)
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
 	if !proc.loaded {
-		raw, err := os.ReadFile(filepath.Join(cfg.DataDir, "applied-generation"))
+		raw, err := os.ReadFile(filepath.Join(s.cfg.DataDir, "applied-generation"))
 		if err == nil {
 			proc.generation, _ = strconv.Atoi(string(bytes.TrimSpace(raw)))
 		}
-		raw, err = os.ReadFile(filepath.Join(cfg.DataDir, "applied-skeleton"))
+		raw, err = os.ReadFile(filepath.Join(s.cfg.DataDir, "applied-skeleton"))
 		if err == nil {
 			proc.skeleton = string(bytes.TrimSpace(raw))
 		}
@@ -200,10 +195,10 @@ func syncConfig(ctx context.Context, cfg Config) error {
 		stopLocked()
 		proc.applied = nil
 		proc.skeleton = ""
-		_ = os.Remove(filepath.Join(cfg.DataDir, "applied-skeleton"))
-		clearAppliedUsers(cfg.DataDir)
-		clearAppliedCore(cfg.DataDir)
-		return writeGeneration(cfg.DataDir, body.Generation)
+		_ = os.Remove(filepath.Join(s.cfg.DataDir, "applied-skeleton"))
+		clearAppliedUsers(s.cfg.DataDir)
+		clearAppliedCore(s.cfg.DataDir)
+		return writeGeneration(s.cfg.DataDir, body.Generation)
 	}
 	bin := coreBin(want)
 	if bin == "" {
@@ -212,19 +207,19 @@ func syncConfig(ctx context.Context, cfg Config) error {
 	assets := make([]geoDesired, 0, len(body.Geo)+len(body.RuleSets))
 	assets = append(assets, body.Geo...)
 	for _, item := range body.RuleSets {
-		assets = append(assets, geoDesired{Name: item.Name, SHA256: item.SHA256})
+		assets = append(assets, geoDesired{Name: item.Name, SHA256: item.SHA256, Token: item.Token})
 	}
-	geoChanged, err := syncAssets(ctx, cfg, cert, assets)
+	geoChanged, err := syncAssets(ctx, s.cfg, assets)
 	if err != nil {
 		return err
 	}
 	switching := proc.cmd != nil && proc.core != want
 	if switching {
-		if err := reportStatsLocked(ctx, cfg); err != nil {
+		if err := reportStatsLocked(ctx, s); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 		}
 	}
-	rendered, changed, err := stageConfig(ctx, cfg.DataDir, want, bin, body.Config, body.Files)
+	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, body.Config, body.Files)
 	if err != nil {
 		if switching {
 			fmt.Fprintf(os.Stderr, "degraded: keeping %s: %s\n", proc.core, err.Error())
@@ -243,16 +238,16 @@ func syncConfig(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-	current := filepath.Join(cfg.DataDir, coreConfigName(want))
+	current := filepath.Join(s.cfg.DataDir, coreConfigName(want))
 	switch {
 	case switching:
 		stopLocked()
-		if err := bootWithRollback(ctx, cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
+		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
 		}
 		fmt.Println("switch", want)
 	case proc.cmd == nil:
-		if err := bootWithRollback(ctx, cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
+		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
 		}
 	default:
@@ -263,15 +258,15 @@ func syncConfig(ctx context.Context, cfg Config) error {
 		}
 		switch plan {
 		case planHot:
-			readded, err := diffLocked(ctx, bin, api, cfg.DataDir, raws, changed)
+			readded, err := diffLocked(ctx, bin, api, s.cfg.DataDir, raws, changed)
 			if err != nil {
 				return err
 			}
-			appliedUsers := appliedUsersLocked(cfg.DataDir)
+			appliedUsers := appliedUsersLocked(s.cfg.DataDir)
 			for tag := range readded {
 				delete(appliedUsers, tag)
 			}
-			if err := reconcileUsers(ctx, bin, api, cfg.DataDir, body.Shared); err != nil {
+			if err := reconcileUsers(ctx, bin, api, s.cfg.DataDir, body.Shared); err != nil {
 				return err
 			}
 			proc.applied = raws
@@ -282,19 +277,19 @@ func syncConfig(ctx context.Context, cfg Config) error {
 			}
 			if err := reloadMihomo(ctx, api, abs); err != nil {
 				fmt.Fprintln(os.Stderr, err.Error())
-				if err := restartLocked(ctx, cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
+				if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 					return err
 				}
 			} else {
 				fmt.Println("reload")
 			}
 		default:
-			if err := restartLocked(ctx, cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
+			if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 				return err
 			}
 		}
 	}
-	return writeGeneration(cfg.DataDir, body.Generation)
+	return writeGeneration(s.cfg.DataDir, body.Generation)
 }
 
 func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw json.RawMessage, files []desiredFile) ([]byte, bool, error) {
@@ -382,8 +377,8 @@ func bootWithRollback(ctx context.Context, cfg Config, api, bin string, kind cor
 	return fmt.Errorf("%s start failed, rolled back to previous config: %w", kind, err)
 }
 
-func restartLocked(ctx context.Context, cfg Config, api, bin string, kind coreKind, current string, raws map[string][]byte, skel string, shared []sharedDesired) error {
-	if err := reportStatsLocked(ctx, cfg); err != nil {
+func restartLocked(ctx context.Context, s *session, cfg Config, api, bin string, kind coreKind, current string, raws map[string][]byte, skel string, shared []sharedDesired) error {
+	if err := reportStatsLocked(ctx, s); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 	}
 	stopLocked()
@@ -393,30 +388,6 @@ func restartLocked(ctx context.Context, cfg Config, api, bin string, kind coreKi
 	fmt.Println("restart")
 	return nil
 }
-
-func httpNew(ctx context.Context, url string, cert tls.Certificate, pin string) (*pinnedResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	res, err := httpClient(pin, cert).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	return &pinnedResponse{status: res.StatusCode, body: body}, nil
-}
-
-type pinnedResponse struct {
-	status int
-	body   []byte
-}
-
-func (r *pinnedResponse) Close() error { return nil }
 
 func startLocked(ctx context.Context, kind coreKind, bin, config, dir string) error {
 	cmd := exec.Command(bin, coreRunArgs(kind, config, dir)...)

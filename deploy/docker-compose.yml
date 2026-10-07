@@ -7,8 +7,8 @@ services:
     environment:
       AGENT_RUNTIME: docker
       AGENT_DATA_DIR: /var/lib/nowhere-agent
-      AGENT_PANEL_ENDPOINTS: https://panel.example:8089
-      AGENT_PANEL_SPKI_PIN: change-me
+      AGENT_PANEL_ENDPOINTS: https://panel.example
+      AGENT_PANEL_KEYPIN: change-me
       AGENT_XRAY_BIN: /usr/local/bin/xray
       AGENT_XRAY_API_ADDR: 127.0.0.1:10085
       AGENT_MIHOMO_BIN: /usr/local/bin/mihomo

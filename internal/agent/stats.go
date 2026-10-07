@@ -3,13 +3,10 @@ package agent
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os/exec"
-	"path/filepath"
 )
 
 func collectStats(ctx context.Context, bin, api string) (map[string]int64, error) {
@@ -36,39 +33,25 @@ func collectStats(ctx context.Context, bin, api string) (map[string]int64, error
 	return counters, nil
 }
 
-func submitStats(ctx context.Context, cfg Config, counters map[string]int64) error {
-	cert, err := tls.LoadX509KeyPair(filepath.Join(cfg.DataDir, "agent.crt"), filepath.Join(cfg.DataDir, "agent.key"))
+func submitStats(ctx context.Context, s *session, counters map[string]int64) error {
+	body, err := json.Marshal(map[string]any{"counters": counters})
 	if err != nil {
 		return err
 	}
-	body, _ := json.Marshal(map[string]any{"counters": counters})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Endpoints[0]+"/api/agent/stats", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	res, err := httpClient(cfg.Pin, cert).Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("stats status %d", res.StatusCode)
-	}
-	return nil
+	return s.send(ctx, message{T: msgStats, D: body})
 }
 
-func reportStats(ctx context.Context, cfg Config) error {
+func reportStats(ctx context.Context, s *session) error {
 	core, _ := runningCoreInfo()
-	return reportCounters(ctx, cfg, core)
+	return reportCounters(ctx, s, core)
 }
 
-// reportStatsLocked 供已持 proc.mu 的 syncConfig/restartLocked 使用；Go 锁不可重入。
-func reportStatsLocked(ctx context.Context, cfg Config) error {
-	return reportCounters(ctx, cfg, proc.core)
+// reportStatsLocked 供已持 proc.mu 的 applyDesired/restartLocked 使用；Go 锁不可重入。
+func reportStatsLocked(ctx context.Context, s *session) error {
+	return reportCounters(ctx, s, proc.core)
 }
 
-func reportCounters(ctx context.Context, cfg Config, core coreKind) error {
+func reportCounters(ctx context.Context, s *session, core coreKind) error {
 	var counters map[string]int64
 	var err error
 	switch core {
@@ -89,5 +72,5 @@ func reportCounters(ctx context.Context, cfg Config, core coreKind) error {
 	if len(counters) == 0 {
 		return nil
 	}
-	return submitStats(ctx, cfg, counters)
+	return submitStats(ctx, s, counters)
 }
