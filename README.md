@@ -24,7 +24,7 @@ cp .env.agent.example .env.agent
 GOWORK=off go run ./cmd/agent
 ```
 
-systemd 单元是 [`deploy/nowhere-agent.service`](./deploy/nowhere-agent.service)。面板地址、指纹和安装令牌放在 `/etc/nowhere/agent.env`，不要写进单元文件。
+systemd 单元是 [`deploy/nowhere-agent.service`](./deploy/nowhere-agent.service)。服务形态执行 `nowhere-agent -config /etc/nowhere/agent.conf`，只认这份文件，不看进程环境。示例是 [`deploy/agent.conf.example`](./deploy/agent.conf.example)。Docker 与本目录 `.env.agent` 仍走环境变量。
 
 ## 镜像
 
@@ -50,7 +50,7 @@ docker build -f deploy/Dockerfile.source \
 docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 ```
 
-[`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 拉取 `ghcr.io/nwdock/nwdock-agent:latest`，不用上面的本地标签。要 xray 或 sing-box 时把 `image` 换成 `:xray` 或 `:singbox`。必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。
+[`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 拉取 `ghcr.io/nwdock/nwdock-agent:latest`，不用上面的本地标签。它把 `/etc/nowhere/agent.conf` 只读挂进容器，启动参数是 `-config`。文件里写 `AGENT_RUNTIME=docker`，核心路径用镜像内的 `/usr/local/bin/xray` 和 `/usr/local/bin/sing-box`。要 xray 或 sing-box 时把 `image` 换成 `:xray` 或 `:singbox`。必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。安装命令走 [`deploy/install.sh`](./deploy/install.sh)，写出的就是这份配置和 compose。
 
 ## 发布
 

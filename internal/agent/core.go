@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"nowhere.local/agent/internal/envfile"
@@ -51,15 +52,52 @@ func legacyCoreBinEnv(kind coreKind) string {
 	}
 }
 
+type fileRuntime struct {
+	xrayBin    string
+	singboxBin string
+	xrayAPI    string
+}
+
+// activeFile is set only for -config. Nil means core paths still come from the environment.
+var activeFile atomic.Pointer[fileRuntime]
+
+// ApplyFileRuntime makes core bin and API lookups use cfg and ignore the environment.
+func ApplyFileRuntime(cfg Config) {
+	activeFile.Store(&fileRuntime{
+		xrayBin:    cfg.XrayBin,
+		singboxBin: cfg.SingboxBin,
+		xrayAPI:    cfg.XrayAPI,
+	})
+}
+
+// ClearFileRuntime restores environment lookups. Tests use it to isolate -config.
+func ClearFileRuntime() {
+	activeFile.Store(nil)
+}
+
 func coreBin(kind coreKind) string {
 	if kind == coreMihomo {
 		return ""
+	}
+	if rt := activeFile.Load(); rt != nil {
+		switch kind {
+		case coreSingbox:
+			return rt.singboxBin
+		default:
+			return rt.xrayBin
+		}
 	}
 	value, _ := envfile.First(coreBinEnv(kind), legacyCoreBinEnv(kind))
 	return value
 }
 
 func coreAPIAddr() string {
+	if rt := activeFile.Load(); rt != nil {
+		if rt.xrayAPI != "" {
+			return rt.xrayAPI
+		}
+		return "127.0.0.1:10085"
+	}
 	api, _ := envfile.First("AGENT_XRAY_API_ADDR", "XRAY_API_ADDR")
 	if api == "" {
 		api = "127.0.0.1:10085"

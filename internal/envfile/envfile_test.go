@@ -80,6 +80,35 @@ func loadExample(t *testing.T, path string) {
 	}
 }
 
+func TestReadLeavesEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.conf")
+	body := "NOWHERE_ENVFILE_FILE=from-file\nNOWHERE_ENVFILE_ONLY_ENV=from-file\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreEnv(t, "NOWHERE_ENVFILE_FILE")
+	restoreEnv(t, "NOWHERE_ENVFILE_ONLY_ENV")
+	t.Setenv("NOWHERE_ENVFILE_FILE", "from-env")
+	values, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values["NOWHERE_ENVFILE_FILE"] != "from-file" || values["NOWHERE_ENVFILE_ONLY_ENV"] != "from-file" {
+		t.Fatal(values)
+	}
+	assertEnv(t, "NOWHERE_ENVFILE_FILE", "from-env")
+	if _, ok := os.LookupEnv("NOWHERE_ENVFILE_ONLY_ENV"); ok {
+		t.Fatal("Read changed the environment")
+	}
+}
+
+func TestReadMissing(t *testing.T) {
+	if _, err := Read(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestLoadMissing(t *testing.T) {
 	if err := Load(filepath.Join(t.TempDir(), "missing")); err != nil {
 		t.Fatal(err)

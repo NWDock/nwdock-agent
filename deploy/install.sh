@@ -58,7 +58,7 @@ fi
 
 etc_dir="${prefix}/etc/nowhere"
 data_dir="${prefix}/var/lib/nowhere-agent"
-env_file="${etc_dir}/agent.env"
+conf_file="${etc_dir}/agent.conf"
 compose="${etc_dir}/docker-compose.yml"
 
 install -d -m 0700 "$etc_dir" "$data_dir"
@@ -69,8 +69,12 @@ umask 077
   printf 'AGENT_PANEL_ENDPOINTS=%s\n' "$AGENT_PANEL_ENDPOINTS"
   printf 'AGENT_PANEL_KEYPIN=%s\n' "$AGENT_PANEL_KEYPIN"
   printf 'AGENT_ENROLL_TOKEN=%s\n' "$AGENT_ENROLL_TOKEN"
-} >"$env_file"
-chmod 0600 "$env_file"
+  printf 'AGENT_XRAY_BIN=/usr/local/bin/xray\n'
+  printf 'AGENT_XRAY_API_ADDR=127.0.0.1:10085\n'
+  printf 'AGENT_SINGBOX_BIN=/usr/local/bin/sing-box\n'
+} >"$conf_file"
+chmod 0600 "$conf_file"
+rm -f "${etc_dir}/agent.env"
 
 cat >"$compose" <<EOF
 services:
@@ -80,10 +84,12 @@ services:
     network_mode: host
     cap_add:
       - NET_BIND_SERVICE
-    env_file:
-      - ${env_file}
+    command:
+      - -config
+      - /etc/nowhere/agent.conf
     volumes:
       - ${data_dir}:/var/lib/nowhere-agent
+      - ${conf_file}:/etc/nowhere/agent.conf:ro
 EOF
 chmod 0600 "$compose"
 

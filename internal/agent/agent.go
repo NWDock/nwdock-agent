@@ -18,33 +18,94 @@ import (
 var Version = "0.0.0"
 
 type Config struct {
-	Runtime   string
-	DataDir   string
-	Endpoints []string
-	KeyPin    string
-	Token     string
-	Image     string
+	Runtime    string
+	DataDir    string
+	Endpoints  []string
+	KeyPin     string
+	Token      string
+	Image      string
+	XrayBin    string
+	SingboxBin string
+	XrayAPI    string
+
+	fromFile   bool
+	noteMihomo bool
 }
 
+// LoadConfig reads the process environment. Existing variables win over files
+// already loaded into the environment.
 func LoadConfig(envDir string) (Config, error) {
-	dataDir, _ := envfile.First("AGENT_DATA_DIR", "DATA_DIR")
-	keyPin, _ := envfile.First("AGENT_PANEL_KEYPIN")
-	token, _ := envfile.First("AGENT_ENROLL_TOKEN", "NOWHERE_ENROLL_TOKEN")
-	image, _ := envfile.First("AGENT_IMAGE_TAG", "IMAGE_TAG")
-	endpoints, _ := envfile.First("AGENT_PANEL_ENDPOINTS", "PANEL_ENDPOINTS")
+	return buildConfig(envDir, func(primary string, aliases ...string) string {
+		value, _ := envfile.First(primary, aliases...)
+		return value
+	}, func(key string) bool {
+		value, ok := os.LookupEnv(key)
+		return ok && value != ""
+	})
+}
+
+// LoadConfigFile reads path as the only source of agent settings. The process
+// environment is ignored and then cleared of agent keys so child processes
+// do not inherit them. mode must be 0600 or 0400.
+func LoadConfigFile(path string) (Config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return Config{}, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return Config{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return Config{}, fmt.Errorf("%s: 不是普通文件", abs)
+	}
+	perm := info.Mode().Perm()
+	if perm != 0o600 && perm != 0o400 {
+		return Config{}, fmt.Errorf("%s: 权限必须是 0600 或 0400", abs)
+	}
+	values, err := envfile.Read(abs)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg, err := buildConfig(filepath.Dir(abs), func(primary string, aliases ...string) string {
+		value, _ := envfile.Lookup(values, primary, aliases...)
+		return value
+	}, func(key string) bool {
+		value, ok := values[key]
+		return ok && value != ""
+	})
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.fromFile = true
+	scrubAgentEnv()
+	ApplyFileRuntime(cfg)
+	return cfg, nil
+}
+
+func buildConfig(base string, pick func(primary string, aliases ...string) string, set func(string) bool) (Config, error) {
+	dataDir := pick("AGENT_DATA_DIR", "DATA_DIR")
+	keyPin := pick("AGENT_PANEL_KEYPIN")
+	token := pick("AGENT_ENROLL_TOKEN", "NOWHERE_ENROLL_TOKEN")
+	image := pick("AGENT_IMAGE_TAG", "IMAGE_TAG")
+	endpoints := pick("AGENT_PANEL_ENDPOINTS", "PANEL_ENDPOINTS")
 	if keyPin == "" {
 		for _, old := range []string{"AGENT_PANEL_SPKI_PIN", "PANEL_SPKI_PIN"} {
-			if value, ok := os.LookupEnv(old); ok && value != "" {
+			if set(old) {
 				return Config{}, fmt.Errorf("%s 已改名 AGENT_PANEL_KEYPIN，请改成面板身份公钥指纹（keypin hex）", old)
 			}
 		}
 	}
 	cfg := Config{
-		Runtime: os.Getenv("AGENT_RUNTIME"),
-		DataDir: dataDir,
-		KeyPin:  keyPin,
-		Token:   token,
-		Image:   image,
+		Runtime:    pick("AGENT_RUNTIME"),
+		DataDir:    dataDir,
+		KeyPin:     keyPin,
+		Token:      token,
+		Image:      image,
+		XrayBin:    pick("AGENT_XRAY_BIN", "XRAY_BIN"),
+		SingboxBin: pick("AGENT_SINGBOX_BIN", "SINGBOX_BIN"),
+		XrayAPI:    pick("AGENT_XRAY_API_ADDR", "XRAY_API_ADDR"),
+		noteMihomo: pick("AGENT_MIHOMO_BIN", "MIHOMO_BIN") != "",
 	}
 	if cfg.Runtime != "service" && cfg.Runtime != "docker" {
 		return Config{}, errors.New("AGENT_RUNTIME must be service or docker")
@@ -54,7 +115,7 @@ func LoadConfig(envDir string) (Config, error) {
 	}
 	// 核心进程以 DataDir 为工作目录启动，相对路径会让配置路径指错目录，这里统一转绝对。
 	// env 文件在上一级时，相对路径对着那份文件，而不是当前工作目录。
-	base := envDir
+	// -config 时相对路径对着配置文件所在目录。
 	if base == "" {
 		base = "."
 	}
@@ -76,6 +137,30 @@ func LoadConfig(envDir string) (Config, error) {
 	return cfg, nil
 }
 
+// scrubAgentEnv drops agent settings from the process environment so a core
+// subprocess started with os.Environ cannot see them.
+func scrubAgentEnv() {
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && strings.HasPrefix(key, "AGENT_") {
+			os.Unsetenv(key)
+		}
+	}
+	for _, key := range []string{
+		"DATA_DIR",
+		"PANEL_ENDPOINTS",
+		"PANEL_SPKI_PIN",
+		"NOWHERE_ENROLL_TOKEN",
+		"IMAGE_TAG",
+		"XRAY_BIN",
+		"XRAY_API_ADDR",
+		"SINGBOX_BIN",
+		"MIHOMO_BIN",
+	} {
+		os.Unsetenv(key)
+	}
+}
+
 // Run 建立并维持 nwdock-agent-v1 加密通道：desired 推送驱动配置应用，
 // 15s 心跳、60s stats；断开走退避 + jitter + endpoint 轮转重连。
 func Run(ctx context.Context, cfg Config) error {
@@ -88,7 +173,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	backoff := time.Second
 	tokenRetried := false
-	if bin, _ := envfile.First("AGENT_MIHOMO_BIN", "MIHOMO_BIN"); bin != "" {
+	if cfg.fromFile {
+		if cfg.noteMihomo {
+			fmt.Fprintln(os.Stderr, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
+		}
+	} else if bin, _ := envfile.First("AGENT_MIHOMO_BIN", "MIHOMO_BIN"); bin != "" {
 		fmt.Fprintln(os.Stderr, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
 	}
 	for {

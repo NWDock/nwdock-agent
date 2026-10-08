@@ -2,13 +2,7 @@
 Description=Nowhere node agent
 
 [Service]
-Environment=AGENT_RUNTIME=service
-Environment=AGENT_DATA_DIR=/var/lib/nowhere-agent
-Environment=AGENT_XRAY_BIN=/usr/local/bin/xray
-Environment=AGENT_XRAY_API_ADDR=127.0.0.1:10085
-Environment=AGENT_SINGBOX_BIN=/usr/local/bin/sing-box
-EnvironmentFile=-/etc/nowhere/agent.env
-ExecStart=/usr/local/bin/nowhere-agent
+ExecStart=/usr/local/bin/nowhere-agent -config /etc/nowhere/agent.conf
 Restart=on-failure
 
 [Install]

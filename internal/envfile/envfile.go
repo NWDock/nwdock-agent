@@ -38,6 +38,17 @@ func Load(path string) error {
 	return nil
 }
 
+// Read parses path and returns its assignments. It does not change the process
+// environment. A missing file is an error.
+func Read(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return parse(path, file)
+}
+
 func parse(path string, r io.Reader) (map[string]string, error) {
 	values := map[string]string{}
 	scanner := bufio.NewScanner(r)
@@ -144,6 +155,21 @@ func First(primary string, aliases ...string) (string, string) {
 	}
 	for _, name := range aliases {
 		if v, ok := os.LookupEnv(name); ok && v != "" {
+			noteLegacy(name)
+			return v, name
+		}
+	}
+	return "", ""
+}
+
+// Lookup returns primary when it is non-empty in values. Otherwise it returns
+// the first non-empty alias and notes that alias on stderr once, without the value.
+func Lookup(values map[string]string, primary string, aliases ...string) (string, string) {
+	if v, ok := values[primary]; ok && v != "" {
+		return v, ""
+	}
+	for _, name := range aliases {
+		if v, ok := values[name]; ok && v != "" {
 			noteLegacy(name)
 			return v, name
 		}
