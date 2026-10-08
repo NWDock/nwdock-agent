@@ -21,7 +21,7 @@ import (
 
 type coreProc struct {
 	mu           sync.Mutex
-	cmd          *exec.Cmd
+	rt           coreRuntime
 	core         coreKind
 	version      string
 	generation   int
@@ -170,9 +170,15 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		Shared     []sharedDesired  `json:"shared"`
 		Geo        []geoDesired     `json:"geo"`
 		RuleSets   []ruleSetDesired `json:"rule_sets"`
+		Quota      json.RawMessage  `json:"quota"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return err
+	}
+	if len(body.Quota) > 0 && string(body.Quota) != "null" {
+		if err := traffic.ApplySnapshot(body.Quota); err != nil {
+			return err
+		}
 	}
 	want := normalizeCore(body.Core)
 	proc.mu.Lock()
@@ -200,9 +206,12 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		clearAppliedCore(s.cfg.DataDir)
 		return writeGeneration(s.cfg.DataDir, body.Generation)
 	}
-	bin := coreBin(want)
-	if bin == "" {
-		return fmt.Errorf("%s is required", coreBinEnv(want))
+	var bin string
+	if want != coreMihomo {
+		bin = coreBin(want)
+		if bin == "" {
+			return fmt.Errorf("%s is required", coreBinEnv(want))
+		}
 	}
 	assets := make([]geoDesired, 0, len(body.Geo)+len(body.RuleSets))
 	assets = append(assets, body.Geo...)
@@ -213,13 +222,20 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	switching := proc.cmd != nil && proc.core != want
+	switching := runningLocked() && proc.core != want
 	if switching {
 		if err := reportStatsLocked(ctx, s); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 		}
 	}
-	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, body.Config, body.Files)
+	filled, err := materializeWGCF(ctx, s.cfg.DataDir, want, body.Config)
+	if err != nil {
+		if switching {
+			fmt.Fprintf(os.Stderr, "degraded: keeping %s: %s\n", proc.core, err.Error())
+		}
+		return err
+	}
+	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, filled, body.Files)
 	if err != nil {
 		if switching {
 			fmt.Fprintf(os.Stderr, "degraded: keeping %s: %s\n", proc.core, err.Error())
@@ -246,46 +262,36 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 			return err
 		}
 		fmt.Println("switch", want)
-	case proc.cmd == nil:
+	case !runningLocked():
 		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
 		}
 	default:
 		plan := sameCorePlan(want, proc.skeleton != skel)
-		if geoChanged {
-			// 核心只在启动时加载 geo 数据文件，文件有变必须整进程重启。
+		if geoChanged && want != coreMihomo {
+			// 外部核心只在启动时加载 geo 数据文件，文件有变必须整进程重启。
+			// 内置 clash-meta-nw 重新 Parse 并套用即可。
 			plan = planRestart
 		}
 		switch plan {
-		case planHot:
-			readded, err := diffLocked(ctx, bin, api, s.cfg.DataDir, raws, changed)
-			if err != nil {
+		case planRestart:
+			if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 				return err
 			}
-			appliedUsers := appliedUsersLocked(s.cfg.DataDir)
-			for tag := range readded {
-				delete(appliedUsers, tag)
+		default:
+			if proc.rt == nil {
+				return errors.New("core is not running")
 			}
-			if err := reconcileUsers(ctx, bin, api, s.cfg.DataDir, body.Shared); err != nil {
-				return err
-			}
-			proc.applied = raws
-		case planReload:
-			abs, err := filepath.Abs(current)
-			if err != nil {
-				return err
-			}
-			if err := reloadMihomo(ctx, api, abs); err != nil {
+			if err := proc.rt.Apply(ctx, current, s.cfg.DataDir, raws, skel, body.Shared, geoChanged, changed); err != nil {
+				if !errors.Is(err, errNeedRestart) && want != coreMihomo {
+					return err
+				}
 				fmt.Fprintln(os.Stderr, err.Error())
 				if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 					return err
 				}
-			} else {
+			} else if plan == planReload {
 				fmt.Println("reload")
-			}
-		default:
-			if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
-				return err
 			}
 		}
 	}
@@ -302,18 +308,23 @@ func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw
 		restore()
 		return nil, false, err
 	}
+	if kind == coreMihomo {
+		abs, err := absolutizeMihomo(rendered, dir)
+		if err != nil {
+			restore()
+			return nil, false, err
+		}
+		rendered = abs
+	}
 	next := filepath.Join(dir, coreStagingName(kind))
 	if err := os.WriteFile(next, rendered, 0o600); err != nil {
 		restore()
 		return nil, false, err
 	}
-	test := exec.CommandContext(ctx, bin, coreTestArgs(kind, next, dir)...)
-	test.Dir = dir
-	test.Env = coreEnv(kind, dir)
-	if out, err := test.CombinedOutput(); err != nil {
+	if err := testCoreConfig(ctx, kind, bin, next, dir); err != nil {
 		restore()
 		_ = os.Remove(next)
-		return nil, false, cmdFail(string(kind)+" test", out, err)
+		return nil, false, err
 	}
 	final := filepath.Join(dir, coreConfigName(kind))
 	if prevData, err := os.ReadFile(final); err == nil {
@@ -389,65 +400,52 @@ func restartLocked(ctx context.Context, s *session, cfg Config, api, bin string,
 	return nil
 }
 
+func testCoreConfig(ctx context.Context, kind coreKind, bin, config, dir string) error {
+	if kind == coreMihomo {
+		return newEmbeddedRuntime().Test(ctx, config, dir)
+	}
+	return newExecRuntime(kind, bin, coreAPIAddr()).Test(ctx, config, dir)
+}
+
 func startLocked(ctx context.Context, kind coreKind, bin, config, dir string) error {
-	cmd := exec.Command(bin, coreRunArgs(kind, config, dir)...)
-	cmd.Dir = dir
-	cmd.Env = coreEnv(kind, dir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	var rt coreRuntime
+	var err error
+	if kind == coreMihomo {
+		rt = newEmbeddedRuntime()
+		err = rt.Start(ctx, config, dir)
+	} else {
+		rt = newExecRuntime(kind, bin, coreAPIAddr())
+		err = rt.Start(ctx, config, dir)
+	}
+	if err != nil {
+		if rt != nil {
+			rt.Stop()
+		}
 		return err
 	}
-	proc.cmd = cmd
+	proc.rt = rt
 	proc.core = kind
-	proc.version = probeVersion(ctx, bin, kind)
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- cmd.Wait() }()
-	select {
-	case err := <-waitErr:
-		proc.mu.Lock()
-		if proc.cmd == cmd {
-			proc.cmd = nil
-			proc.core = ""
-			proc.version = ""
-		}
-		proc.mu.Unlock()
-		if err != nil {
-			return fmt.Errorf("%s exited: %s", kind, err.Error())
-		}
-		return fmt.Errorf("%s exited immediately", kind)
-	case <-time.After(2 * time.Second):
-	}
-	go func() {
-		<-waitErr
-		proc.mu.Lock()
-		if proc.cmd == cmd {
-			proc.cmd = nil
-			proc.core = ""
-			proc.version = ""
-		}
-		proc.mu.Unlock()
-	}()
+	proc.version = rt.Version()
 	return nil
 }
 
 func runningLocked() bool {
-	return proc.cmd != nil
+	return proc.rt != nil && proc.rt.Running()
 }
 
 func runningCoreInfo() (coreKind, string) {
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
-	if proc.cmd == nil {
+	if proc.rt == nil || !proc.rt.Running() {
 		return "", ""
 	}
 	return proc.core, proc.version
 }
 
 func stopLocked() {
-	if proc.cmd != nil && proc.cmd.Process != nil {
-		_ = proc.cmd.Process.Kill()
-		proc.cmd = nil
+	if proc.rt != nil {
+		proc.rt.Stop()
+		proc.rt = nil
 	}
 	proc.core = ""
 	proc.version = ""

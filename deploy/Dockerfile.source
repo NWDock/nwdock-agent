@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# 构建时按 deploy/cores.versions 拉三个核心的 tag，并放入 Loyalsoldier 的 geoip.dat / geosite.dat。
-# 手工只 COPY 已有二进制时，用同目录的 Dockerfile。
+# 构建 agent（内置 clash-meta-nw）以及 xray、sing-box 两个外部核心，并放入 Loyalsoldier 的 geoip.dat / geosite.dat。
+# 手工只 COPY 已有二进制时，用同目录的 Dockerfile.image。
 
 ARG VERSION=0.0.0
 ARG XRAY_TAG=v2.2.1
@@ -9,13 +9,16 @@ ARG SINGBOX_TAG=v2.2.1
 ARG GEO_TAG=202610052207
 
 FROM golang:1.26-alpine AS agent
+RUN apk add --no-cache git
 WORKDIR /src
+ARG MIHOMO_TAG=v2.2.1
 COPY go.mod go.sum ./
-RUN go mod download
+COPY third_party/clash-meta-nw third_party/clash-meta-nw
+RUN GOWORK=off go mod download
 COPY . .
 ARG VERSION
-RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION}" \
+RUN CGO_ENABLED=0 GOWORK=off go build -trimpath \
+    -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION} -X github.com/metacubex/mihomo/constant.Version=${MIHOMO_TAG}" \
     -o /out/nowhere-agent ./cmd/agent
 
 # Xray 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
@@ -26,16 +29,6 @@ WORKDIR /src
 RUN git clone --depth 1 --branch "${XRAY_TAG}" https://github.com/ohmycggk/Xray-core.git .
 ENV GOWORK=off
 RUN CGO_ENABLED=0 go build -trimpath -o /out/xray ./main
-
-FROM golang:1.26-alpine AS mihomo
-RUN apk add --no-cache git
-ARG MIHOMO_TAG=v2.2.1
-WORKDIR /src
-RUN git clone --depth 1 --branch "${MIHOMO_TAG}" https://github.com/ohmycggk/clash-meta-nw.git .
-ENV GOWORK=off
-RUN CGO_ENABLED=0 go build -trimpath -tags with_gvisor \
-    -ldflags "-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_TAG} -w -s -buildid=" \
-    -o /out/mihomo .
 
 FROM golang:1.25.12-alpine AS singbox
 RUN apk add --no-cache git
@@ -74,7 +67,6 @@ RUN apt-get update \
     && mkdir -p /usr/share/nowhere /var/lib/nowhere-agent
 COPY --from=agent /out/nowhere-agent /usr/local/bin/nowhere-agent
 COPY --from=xray /out/xray /usr/local/bin/xray
-COPY --from=mihomo /out/mihomo /usr/local/bin/mihomo
 COPY --from=singbox /out/sing-box /usr/local/bin/sing-box
 COPY --from=geo /out/geoip.dat /out/geosite.dat /usr/share/nowhere/
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -92,7 +84,6 @@ ENV AGENT_RUNTIME=docker \
     AGENT_DATA_DIR=/var/lib/nowhere-agent \
     XRAY_BIN=/usr/local/bin/xray \
     XRAY_API_ADDR=127.0.0.1:10085 \
-    MIHOMO_BIN=/usr/local/bin/mihomo \
     SINGBOX_BIN=/usr/local/bin/sing-box
 VOLUME ["/var/lib/nowhere-agent"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

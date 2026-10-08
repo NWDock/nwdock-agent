@@ -33,8 +33,17 @@ func collectStats(ctx context.Context, bin, api string) (map[string]int64, error
 	return counters, nil
 }
 
-func submitStats(ctx context.Context, s *session, counters map[string]int64) error {
-	body, err := json.Marshal(map[string]any{"counters": counters})
+func submitStats(ctx context.Context, s *session, counters map[string]int64, withQuota bool) error {
+	payload := map[string]any{"counters": counters}
+	if withQuota {
+		if usage, ok := traffic.usage(); ok {
+			payload["quota"] = usage
+		}
+	}
+	if len(counters) == 0 && payload["quota"] == nil {
+		return nil
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -52,25 +61,31 @@ func reportStatsLocked(ctx context.Context, s *session) error {
 }
 
 func reportCounters(ctx context.Context, s *session, core coreKind) error {
+	var rt coreRuntime
+	if proc.rt != nil && proc.rt.Running() && (core == "" || proc.rt.Kind() == core) {
+		rt = proc.rt
+		core = rt.Kind()
+	}
 	var counters map[string]int64
 	var err error
-	switch core {
-	case coreMihomo:
-		counters = mihomoStats.counters()
-	case coreSingbox:
+	switch {
+	case rt != nil:
+		counters, err = rt.Counters(ctx)
+	case core == coreMihomo:
+		counters = traffic.counters()
+	case core == coreSingbox:
 		counters, err = collectSingboxStats(ctx, coreAPIAddr())
-	default:
+	case core == coreXray:
 		bin := coreBin(coreXray)
 		if bin == "" {
 			return errors.New("AGENT_XRAY_BIN is required")
 		}
 		counters, err = collectStats(ctx, bin, coreAPIAddr())
+	default:
+		return submitStats(ctx, s, nil, true)
 	}
 	if err != nil {
 		return err
 	}
-	if len(counters) == 0 {
-		return nil
-	}
-	return submitStats(ctx, s, counters)
+	return submitStats(ctx, s, counters, core == coreMihomo)
 }

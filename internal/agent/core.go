@@ -1,12 +1,8 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,10 +33,10 @@ func normalizeCore(raw string) coreKind {
 
 func coreBinEnv(kind coreKind) string {
 	switch kind {
-	case coreMihomo:
-		return "AGENT_MIHOMO_BIN"
 	case coreSingbox:
 		return "AGENT_SINGBOX_BIN"
+	case coreMihomo:
+		return ""
 	default:
 		return "AGENT_XRAY_BIN"
 	}
@@ -48,8 +44,6 @@ func coreBinEnv(kind coreKind) string {
 
 func legacyCoreBinEnv(kind coreKind) string {
 	switch kind {
-	case coreMihomo:
-		return "MIHOMO_BIN"
 	case coreSingbox:
 		return "SINGBOX_BIN"
 	default:
@@ -58,6 +52,9 @@ func legacyCoreBinEnv(kind coreKind) string {
 }
 
 func coreBin(kind coreKind) string {
+	if kind == coreMihomo {
+		return ""
+	}
 	value, _ := envfile.First(coreBinEnv(kind), legacyCoreBinEnv(kind))
 	return value
 }
@@ -94,8 +91,6 @@ func coreStagingName(kind coreKind) string {
 
 func coreTestArgs(kind coreKind, config, dir string) []string {
 	switch kind {
-	case coreMihomo:
-		return []string{"-d", dir, "-t", "-f", config}
 	case coreSingbox:
 		return []string{"check", "-c", config}
 	default:
@@ -105,8 +100,6 @@ func coreTestArgs(kind coreKind, config, dir string) []string {
 
 func coreRunArgs(kind coreKind, config, dir string) []string {
 	switch kind {
-	case coreMihomo:
-		return []string{"-d", dir, "-f", config}
 	case coreSingbox:
 		return []string{"run", "-c", config}
 	default:
@@ -115,9 +108,6 @@ func coreRunArgs(kind coreKind, config, dir string) []string {
 }
 
 func coreVersionArgs(kind coreKind) []string {
-	if kind == coreMihomo {
-		return []string{"-v"}
-	}
 	return []string{"version"}
 }
 
@@ -157,25 +147,6 @@ func probeVersion(ctx context.Context, bin string, kind coreKind) string {
 		line = line[:64]
 	}
 	return line
-}
-
-func reloadMihomo(ctx context.Context, api, configPath string) error {
-	body, _ := json.Marshal(map[string]string{"path": configPath})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://"+api+"/configs?force=true", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		return fmt.Errorf("mihomo reload: %w", err)
-	}
-	defer res.Body.Close()
-	_, _ = io.Copy(io.Discard, res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("mihomo reload status %d", res.StatusCode)
-	}
-	return nil
 }
 
 func writeAppliedCore(dir string, kind coreKind) error {

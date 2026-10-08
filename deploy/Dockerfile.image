@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# 三个 target，各打一个镜像标签，里面只有一个核心。
+# 三个 target。mihomo 只含 agent，核心在进程内；xray / singbox 仍带对应二进制，也能切到内置核心。
 # docker build --target xray|mihomo|singbox
 
 FROM debian:bookworm-slim AS base
@@ -23,7 +23,6 @@ ENV AGENT_RUNTIME=docker \
     AGENT_DATA_DIR=/var/lib/nowhere-agent \
     XRAY_BIN=/usr/local/bin/xray \
     XRAY_API_ADDR=127.0.0.1:10085 \
-    MIHOMO_BIN=/usr/local/bin/mihomo \
     SINGBOX_BIN=/usr/local/bin/sing-box
 VOLUME ["/var/lib/nowhere-agent"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
@@ -44,8 +43,6 @@ FROM base AS mihomo
 ARG VERSION=0.0.0
 ARG MIHOMO_TAG=
 ARG GEO_TAG=
-COPY mihomo /usr/local/bin/mihomo
-RUN chmod 755 /usr/local/bin/mihomo
 LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.title="nwdock-agent-mihomo" \

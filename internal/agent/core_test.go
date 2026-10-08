@@ -30,10 +30,9 @@ func TestNormalizeCore(t *testing.T) {
 
 func TestCoreBinFromEnv(t *testing.T) {
 	t.Setenv("AGENT_XRAY_BIN", "")
-	t.Setenv("AGENT_MIHOMO_BIN", "")
+	t.Setenv("AGENT_MIHOMO_BIN", "/opt/mihomo")
 	t.Setenv("AGENT_SINGBOX_BIN", "")
 	t.Setenv("XRAY_BIN", "/opt/xray")
-	t.Setenv("MIHOMO_BIN", "/opt/mihomo")
 	t.Setenv("SINGBOX_BIN", "/opt/sing-box")
 	for _, c := range []struct {
 		kind coreKind
@@ -41,7 +40,6 @@ func TestCoreBinFromEnv(t *testing.T) {
 		bin  string
 	}{
 		{coreXray, "AGENT_XRAY_BIN", "/opt/xray"},
-		{coreMihomo, "AGENT_MIHOMO_BIN", "/opt/mihomo"},
 		{coreSingbox, "AGENT_SINGBOX_BIN", "/opt/sing-box"},
 	} {
 		if got := coreBin(c.kind); got != c.bin {
@@ -55,10 +53,8 @@ func TestCoreBinFromEnv(t *testing.T) {
 	if got := coreBin(coreXray); got != "/opt/agent-xray" {
 		t.Fatalf("new name must win, got %q", got)
 	}
-	t.Setenv("AGENT_MIHOMO_BIN", "")
-	t.Setenv("MIHOMO_BIN", "")
 	if got := coreBin(coreMihomo); got != "" {
-		t.Fatalf("missing mihomo bin must stay empty, got %q", got)
+		t.Fatalf("embedded mihomo must not use an external bin, got %q", got)
 	}
 }
 
@@ -104,10 +100,6 @@ func TestCoreCommands(t *testing.T) {
 			[]string{"run", "-test", "-c", "/d/config.next.json"},
 			[]string{"run", "-c", "/d/config.json"},
 			[]string{"version"}},
-		{coreMihomo,
-			[]string{"-d", "/d", "-t", "-f", "/d/config.next.yaml"},
-			[]string{"-d", "/d", "-f", "/d/config.yaml"},
-			[]string{"-v"}},
 		{coreSingbox,
 			[]string{"check", "-c", "/d/singbox.next.json"},
 			[]string{"run", "-c", "/d/singbox.json"},

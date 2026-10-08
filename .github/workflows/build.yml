@@ -32,11 +32,14 @@ jobs:
           echo "geo=${GEO_TAG}" >> "$GITHUB_OUTPUT"
 
   agent:
+    needs: versions
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -44,9 +47,10 @@ jobs:
       - name: Build agent
         env:
           CGO_ENABLED: "0"
+          GOWORK: "off"
         run: |
           go build -trimpath \
-            -ldflags "-X nowhere.local/agent/internal/agent.Version=${GITHUB_REF_NAME}" \
+            -ldflags "-X nowhere.local/agent/internal/agent.Version=${GITHUB_REF_NAME} -X github.com/metacubex/mihomo/constant.Version=${{ needs.versions.outputs.mihomo }}" \
             -o nowhere-agent ./cmd/agent
       - uses: actions/upload-artifact@v4
         with:
@@ -78,34 +82,6 @@ jobs:
         with:
           name: xray
           path: xray
-          if-no-files-found: error
-
-  mihomo:
-    needs: versions
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ohmycggk/clash-meta-nw
-          ref: ${{ needs.versions.outputs.mihomo }}
-          path: src
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-      - name: Build mihomo
-        working-directory: src
-        env:
-          CGO_ENABLED: "0"
-        run: |
-          go build -trimpath -tags with_gvisor \
-            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${{ needs.versions.outputs.mihomo }} -w -s -buildid=" \
-            -o "$GITHUB_WORKSPACE/mihomo" .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mihomo
-          path: mihomo
           if-no-files-found: error
 
   singbox:
@@ -165,7 +141,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [versions, agent, xray, mihomo, singbox, geo]
+    needs: [versions, agent, xray, singbox, geo]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -220,7 +196,7 @@ jobs:
           gh release delete "${tag}" --yes || true
           gh release create "${tag}" \
             --title "${tag}" \
-            --notes "$(printf 'nwdock-agent %s\n\nxray %s\n%s\n\nmihomo %s\n%s\n\nsing-box %s\n%s\n\ngeo %s\n' \
+            --notes "$(printf 'nwdock-agent %s\n\nxray %s\n%s\n\nclash-meta-nw %s（内置）\n%s\n\nsing-box %s\n%s\n\ngeo %s\n' \
               "${tag}" \
               "${XRAY_TAG}" "${IMAGE_XRAY}" \
               "${MIHOMO_TAG}" "${IMAGE_MIHOMO}" \

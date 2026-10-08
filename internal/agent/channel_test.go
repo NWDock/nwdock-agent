@@ -67,6 +67,7 @@ func TestChannelConstantsMatchSpec(t *testing.T) {
 		{msgStats, "stats"},
 		{msgDesiredReq, "desired_req"},
 		{msgDesired, "desired"},
+		{msgQuota, "quota"},
 	} {
 		if tc.got != tc.want {
 			t.Fatalf("message type %q != %q", tc.got, tc.want)

@@ -88,7 +88,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	backoff := time.Second
 	tokenRetried := false
-	go mihomoStatsLoop(ctx)
+	if bin, _ := envfile.First("AGENT_MIHOMO_BIN", "MIHOMO_BIN"); bin != "" {
+		fmt.Fprintln(os.Stderr, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil

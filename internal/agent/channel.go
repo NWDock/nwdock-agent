@@ -46,6 +46,7 @@ const (
 	msgStats      = "stats"
 	msgDesiredReq = "desired_req"
 	msgDesired    = "desired"
+	msgQuota      = "quota"
 )
 
 // message 是握手后每个 binary 帧的明文：紧凑 JSON {"t":"<type>","d":<任意 JSON>}。
@@ -214,13 +215,20 @@ func (s *session) closeConn() {
 	_ = s.conn.CloseNow()
 }
 
-// serve 驱动整条会话：发 desired_req，15s 心跳 + 保活 ping，60s stats，
-// 收到 desired 推送即应用配置。返回即连接断开，由 Run 走退避重连。
+// serve 驱动整条会话：先上报用量再要 desired（失联期间的字节先入账），
+// 15s 心跳 + 保活 ping，60s stats，低水位时立刻再报一次。
+// 收到 desired 或 quota 即应用。返回即连接断开，由 Run 走退避重连。
 func (s *session) serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.closeConn)
 	defer stop()
 	defer s.closeConn()
+	traffic.setConnected(true)
+	defer traffic.setConnected(false)
 
+	// 先把上一轮还没入账的用量送出，面板再开新的预支轮次。
+	if err := reportStats(ctx, s); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+	}
 	if err := s.requestDesired(ctx); err != nil {
 		return err
 	}
@@ -250,6 +258,11 @@ func (s *session) serve(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-traffic.wake:
+			lastStats = time.Now()
+			if err := reportStats(ctx, s); err != nil {
+				fmt.Fprintln(os.Stderr, err.Error())
+			}
 		case <-heartbeat.C:
 			if err := s.sendHeartbeat(ctx); err != nil {
 				return err
@@ -273,6 +286,10 @@ func (s *session) serve(ctx context.Context) error {
 				return frame.err
 			}
 			switch frame.msg.T {
+			case msgQuota:
+				if err := traffic.ApplySnapshot(frame.msg.D); err != nil {
+					fmt.Fprintln(os.Stderr, err.Error())
+				}
 			case msgDesired:
 				gotDesired = true
 				if err := s.applyDesired(ctx, frame.msg.D); err != nil {

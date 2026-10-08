@@ -18,10 +18,10 @@ cp .env.agent.example .env.agent
 
 ## 运行
 
-在本目录执行。本机需要已经有选中的核心。
+在本目录执行。默认数据面是编进进程的 clash-meta-nw（`third_party/clash-meta-nw`，与 `deploy/cores.versions` 的 `MIHOMO_TAG` 同一 tag）。构建和测试都要 `GOWORK=off`。选 xray 或 sing-box 时，本机还要有对应的可执行文件。`AGENT_MIHOMO_BIN` 会被忽略。
 
 ```bash
-go run ./cmd/agent
+GOWORK=off go run ./cmd/agent
 ```
 
 systemd 单元是 [`deploy/nowhere-agent.service`](./deploy/nowhere-agent.service)。面板地址、指纹和安装令牌放在 `/etc/nowhere/agent.env`，不要写进单元文件。
@@ -30,7 +30,7 @@ systemd 单元是 [`deploy/nowhere-agent.service`](./deploy/nowhere-agent.servic
 
 核心和 geo 的版本钉在 [`deploy/cores.versions`](./deploy/cores.versions)。`geoip.dat` / `geosite.dat` 来自 Loyalsoldier `v2ray-rules-dat`，放在 `/usr/share/nowhere/`。数据目录里还没有这两份文件时，启动时复制过去；面板之后下发的文件会覆盖。sing-box 的 `.srs` 不在镜像里，由面板下发。
 
-本地打一张三个核心都在里面的镜像，标签与 compose 一致：
+本地打一张镜像。clash-meta-nw 在 agent 里面，xray 和 sing-box 仍是镜像里的二进制：
 
 ```bash
 set -a
@@ -45,7 +45,7 @@ docker build -f deploy/Dockerfile.source \
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-`nowhere-agent`、`xray`、`mihomo`、`sing-box` 四个文件已经在当前目录、不想在镜像里编译时，用 [`deploy/Dockerfile`](./deploy/Dockerfile)。它只复制这四个文件，不含 geo：
+`nowhere-agent`、`xray`、`sing-box` 三个文件已经在当前目录、不想在镜像里编译时，用 [`deploy/Dockerfile`](./deploy/Dockerfile)。它只复制这三个文件，不含 geo。mihomo 不需要单独的二进制：
 
 ```bash
 docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
@@ -55,10 +55,10 @@ docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 
 ## 发布
 
-推送 `v` 开头的 tag（如 `v1.0.0`）才发布。Actions 并行编出三个核心，再打三张镜像，每张只有一个核心：
+推送 `v` 开头的 tag（如 `v1.0.0`）才发布。Actions 编出带内置核心的 agent，以及 xray、sing-box 两个外部核心，再打三张镜像：
 
 - `ghcr.io/nwdock/nwdock-agent:xray` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-xray`
 - `ghcr.io/nwdock/nwdock-agent:mihomo` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-mihomo`
 - `ghcr.io/nwdock/nwdock-agent:singbox` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-singbox`
 
-二进制 `nowhere-agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。用发布镜像时，compose 里只保留这张镜像实际带的那个核心。发布镜像不走上面两个本地 Dockerfile。
+`mihomo` 标签只有 agent。`xray` 和 `singbox` 标签额外带对应二进制，也可以在面板里切回内置核心。二进制 `nowhere-agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。发布镜像不走上面两个本地 Dockerfile。
