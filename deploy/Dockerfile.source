@@ -3,9 +3,9 @@
 # 手工只 COPY 已有二进制时，用同目录的 Dockerfile。
 
 ARG VERSION=0.0.0
-ARG XRAY_TAG=v26.9.9
-ARG MIHOMO_TAG=v1.19.31-nw.1
-ARG SINGBOX_TAG=v1.14.0-alpha.41
+ARG XRAY_TAG=v2.2.1
+ARG MIHOMO_TAG=v2.2.1
+ARG SINGBOX_TAG=v2.2.1
 ARG GEO_TAG=202610052207
 
 FROM golang:1.26-alpine AS agent
@@ -18,10 +18,10 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION}" \
     -o /out/nowhere-agent ./cmd/agent
 
-# v26.9.9 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
+# Xray 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
 FROM golang:1.27-alpine AS xray
 RUN apk add --no-cache git
-ARG XRAY_TAG=v26.9.9
+ARG XRAY_TAG=v2.2.1
 WORKDIR /src
 RUN git clone --depth 1 --branch "${XRAY_TAG}" https://github.com/ohmycggk/Xray-core.git .
 ENV GOWORK=off
@@ -29,22 +29,24 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/xray ./main
 
 FROM golang:1.26-alpine AS mihomo
 RUN apk add --no-cache git
-ARG MIHOMO_TAG=v1.19.31-nw.1
+ARG MIHOMO_TAG=v2.2.1
 WORKDIR /src
-RUN git clone --depth 1 --branch "${MIHOMO_TAG}" https://github.com/ohmycggk/mihomo.git .
+RUN git clone --depth 1 --branch "${MIHOMO_TAG}" https://github.com/ohmycggk/clash-meta-nw.git .
 ENV GOWORK=off
 RUN CGO_ENABLED=0 go build -trimpath -tags with_gvisor \
     -ldflags "-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_TAG} -w -s -buildid=" \
     -o /out/mihomo .
 
-FROM golang:1.26-alpine AS singbox
+FROM golang:1.25.12-alpine AS singbox
 RUN apk add --no-cache git
-ARG SINGBOX_TAG=v1.14.0-alpha.41
+ARG SINGBOX_TAG=v2.2.1
 WORKDIR /src
 RUN git clone --depth 1 --branch "${SINGBOX_TAG}" https://github.com/ohmycggk/sing-box.git .
 ENV GOWORK=off
-RUN CGO_ENABLED=0 go build -trimpath \
-    -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" \
+# Go 1.25 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
+RUN tags="$(tr ',' '\n' < release/DEFAULT_BUILD_TAGS_OTHERS | grep -v -x -E 'badlinkname|tfogo_checklinkname0' | tr '\n' ',' | sed 's/,$//'),with_v2ray_api" \
+    && CGO_ENABLED=0 go build -trimpath \
+    -tags "${tags}" \
     -o /out/sing-box ./cmd/sing-box
 
 FROM debian:bookworm-slim AS geo
@@ -62,9 +64,9 @@ RUN curl -fsSL -o geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/rel
 
 FROM debian:bookworm-slim
 ARG VERSION=0.0.0
-ARG XRAY_TAG=v26.9.9
-ARG MIHOMO_TAG=v1.19.31-nw.1
-ARG SINGBOX_TAG=v1.14.0-alpha.41
+ARG XRAY_TAG=v2.2.1
+ARG MIHOMO_TAG=v2.2.1
+ARG SINGBOX_TAG=v2.2.1
 ARG GEO_TAG=202610052207
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

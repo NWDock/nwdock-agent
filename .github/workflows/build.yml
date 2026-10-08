@@ -88,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ohmycggk/mihomo
+          repository: ohmycggk/clash-meta-nw
           ref: ${{ needs.versions.outputs.mihomo }}
           path: src
       - uses: actions/setup-go@v5
@@ -121,15 +121,17 @@ jobs:
           path: src
       - uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod
+          go-version: "1.25.12"
       - name: Build sing-box
         working-directory: src
         env:
           CGO_ENABLED: "0"
           GOWORK: "off"
         run: |
+          # Go 1.25 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
+          tags="$(tr ',' '\n' < release/DEFAULT_BUILD_TAGS_OTHERS | grep -v -x -E 'badlinkname|tfogo_checklinkname0' | tr '\n' ',' | sed 's/,$//'),with_v2ray_api"
           go build -trimpath \
-            -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" \
+            -tags "${tags}" \
             -o "$GITHUB_WORKSPACE/sing-box" ./cmd/sing-box
       - uses: actions/upload-artifact@v4
         with:
@@ -215,6 +217,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
+          gh release delete "${tag}" --yes || true
           gh release create "${tag}" \
             --title "${tag}" \
             --notes "$(printf 'nwdock-agent %s\n\nxray %s\n%s\n\nmihomo %s\n%s\n\nsing-box %s\n%s\n\ngeo %s\n' \
