@@ -171,17 +171,17 @@ jobs:
             --build-arg "GEO_TAG=${GEO_TAG}"
           )
           docker build -f deploy/Dockerfile.image "${args[@]}" --target xray -t "${image}:${tag}-xray" -t "${image}:xray" image
-          docker build -f deploy/Dockerfile.image "${args[@]}" --target mihomo -t "${image}:${tag}-mihomo" -t "${image}:mihomo" image
+          docker build -f deploy/Dockerfile.image "${args[@]}" --target mihomo -t "${image}:${tag}" -t "${image}:latest" image
           docker build -f deploy/Dockerfile.image "${args[@]}" --target singbox -t "${image}:${tag}-singbox" -t "${image}:singbox" image
           docker push "${image}:${tag}-xray"
           docker push "${image}:xray"
-          docker push "${image}:${tag}-mihomo"
-          docker push "${image}:mihomo"
+          docker push "${image}:${tag}"
+          docker push "${image}:latest"
           docker push "${image}:${tag}-singbox"
           docker push "${image}:singbox"
           {
             echo "IMAGE_XRAY=${image}:xray"
-            echo "IMAGE_MIHOMO=${image}:mihomo"
+            echo "IMAGE_LATEST=${image}:latest"
             echo "IMAGE_SINGBOX=${image}:singbox"
             echo "XRAY_TAG=${XRAY_TAG}"
             echo "MIHOMO_TAG=${MIHOMO_TAG}"
@@ -196,10 +196,10 @@ jobs:
           gh release delete "${tag}" --yes || true
           gh release create "${tag}" \
             --title "${tag}" \
-            --notes "$(printf 'nwdock-agent %s\n\nxray %s\n%s\n\nclash-meta-nw %s（内置）\n%s\n\nsing-box %s\n%s\n\ngeo %s\n' \
+            --notes "$(printf 'nwdock-agent %s\n\nxray %s\n%s\n\n内置 %s\n%s\n\nsing-box %s\n%s\n\ngeo %s\n' \
               "${tag}" \
               "${XRAY_TAG}" "${IMAGE_XRAY}" \
-              "${MIHOMO_TAG}" "${IMAGE_MIHOMO}" \
+              "${MIHOMO_TAG}" "${IMAGE_LATEST}" \
               "${SINGBOX_TAG}" "${IMAGE_SINGBOX}" \
               "${GEO_TAG}")" \
             image/nowhere-agent

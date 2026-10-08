@@ -1,6 +1,6 @@
 services:
   agent:
-    image: nowhere-agent:local
+    image: ghcr.io/nwdock/nwdock-agent:latest
     restart: unless-stopped
     network_mode: host
     cap_add:
@@ -10,9 +10,6 @@ services:
       AGENT_DATA_DIR: /var/lib/nowhere-agent
       AGENT_PANEL_ENDPOINTS: https://panel.example
       AGENT_PANEL_KEYPIN: change-me
-      AGENT_XRAY_BIN: /usr/local/bin/xray
-      AGENT_XRAY_API_ADDR: 127.0.0.1:10085
-      AGENT_SINGBOX_BIN: /usr/local/bin/sing-box
     volumes:
       - agent-data:/var/lib/nowhere-agent
 

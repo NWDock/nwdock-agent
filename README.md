@@ -42,7 +42,6 @@ docker build -f deploy/Dockerfile.source \
   --build-arg "SINGBOX_TAG=${SINGBOX_TAG}" \
   --build-arg "GEO_TAG=${GEO_TAG}" \
   -t nowhere-agent:local .
-docker compose -f deploy/docker-compose.yml up -d
 ```
 
 `nowhere-agent`、`xray`、`sing-box` 三个文件已经在当前目录、不想在镜像里编译时，用 [`deploy/Dockerfile`](./deploy/Dockerfile)。它只复制这三个文件，不含 geo。mihomo 不需要单独的二进制：
@@ -51,14 +50,14 @@ docker compose -f deploy/docker-compose.yml up -d
 docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 ```
 
-必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。
+[`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 拉取 `ghcr.io/nwdock/nwdock-agent:latest`，不用上面的本地标签。要 xray 或 sing-box 时把 `image` 换成 `:xray` 或 `:singbox`。必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。
 
 ## 发布
 
 推送 `v` 开头的 tag（如 `v1.0.0`）才发布。Actions 编出带内置核心的 agent，以及 xray、sing-box 两个外部核心，再打三张镜像：
 
 - `ghcr.io/nwdock/nwdock-agent:xray` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-xray`
-- `ghcr.io/nwdock/nwdock-agent:mihomo` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-mihomo`
+- `ghcr.io/nwdock/nwdock-agent:latest` 和 `ghcr.io/nwdock/nwdock-agent:<tag>`
 - `ghcr.io/nwdock/nwdock-agent:singbox` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-singbox`
 
-`mihomo` 标签只有 agent。`xray` 和 `singbox` 标签额外带对应二进制，也可以在面板里切回内置核心。二进制 `nowhere-agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。发布镜像不走上面两个本地 Dockerfile。
+`latest` 标签只有 agent。`xray` 和 `singbox` 标签额外带对应二进制，也可以在面板里切回内置核心。二进制 `nowhere-agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。发布镜像不走上面两个本地 Dockerfile。

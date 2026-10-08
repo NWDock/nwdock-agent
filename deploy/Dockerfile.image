@@ -45,7 +45,7 @@ ARG MIHOMO_TAG=
 ARG GEO_TAG=
 LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.title="nwdock-agent-mihomo" \
+      org.opencontainers.image.title="nwdock-agent" \
       org.opencontainers.image.revision.mihomo="${MIHOMO_TAG}" \
       org.opencontainers.image.revision.geo="${GEO_TAG}"
 
