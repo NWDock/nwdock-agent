@@ -13,7 +13,9 @@ import (
 	"nowhere.local/agent/internal/envfile"
 )
 
-const Version = "0.0.0"
+// Version 由构建期 -ldflags -X nowhere.local/agent/internal/agent.Version=<tag> 注入，
+// 未注入时心跳上报 0.0.0。必须是 var：链接器 -X 只对变量生效。
+var Version = "0.0.0"
 
 type Config struct {
 	Runtime   string
