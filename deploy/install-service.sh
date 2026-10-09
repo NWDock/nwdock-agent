@@ -265,10 +265,10 @@ release_base=${release_base%/}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-download "${release_base}/SHA256SUMS" "$tmp/SHA256SUMS" "nowhere-agent 校验和"
-download "${release_base}/nowhere-agent" "$tmp/nowhere-agent" "nowhere-agent"
-agent_sum=$(awk '$2=="nowhere-agent" || $2=="*nowhere-agent" {print $1; found=1; exit} END {if (!found) exit 1}' "$tmp/SHA256SUMS") || die "校验和里没有 nowhere-agent"
-verify_sha256 "$tmp/nowhere-agent" "$agent_sum"
+download "${release_base}/SHA256SUMS" "$tmp/SHA256SUMS" "agent 校验和"
+download "${release_base}/agent" "$tmp/agent" "agent"
+agent_sum=$(awk '$2=="agent" || $2=="*agent" {print $1; found=1; exit} END {if (!found) exit 1}' "$tmp/SHA256SUMS") || die "校验和里没有 agent"
+verify_sha256 "$tmp/agent" "$agent_sum"
 
 core_bin=""
 case "$AGENT_CORE" in
@@ -289,30 +289,25 @@ case "$AGENT_CORE" in
     ;;
 esac
 
-if [[ -z "$prefix" ]] && systemctl is-active --quiet nowhere-agent; then
-  systemctl stop nowhere-agent
-fi
+root_dir="${prefix}/opt/nwd-agent"
+bin_dir="${root_dir}/bin"
+data_dir="${root_dir}/data"
+conf_file="${root_dir}/agent.conf"
+unit="${root_dir}/nwd-agent.service"
 
-bin_dir="${prefix}/usr/local/bin"
-unit_dir="${prefix}/etc/systemd/system"
-etc_dir="${prefix}/etc/nowhere"
-data_dir="${prefix}/var/lib/nowhere-agent"
-conf_file="${etc_dir}/agent.conf"
-unit="${unit_dir}/nowhere-agent.service"
-
-install -d -m 0755 "$bin_dir" "$unit_dir"
-install -d -m 0700 "$etc_dir" "$data_dir"
-install -m 0755 "$tmp/nowhere-agent" "${bin_dir}/nowhere-agent"
+install -d -m 0700 "$root_dir" "$data_dir"
+install -d -m 0755 "$bin_dir"
+install -m 0755 "$tmp/agent" "${bin_dir}/agent"
 if [[ -n "$core_bin" ]]; then
   install -m 0755 "$tmp/$core_bin" "${bin_dir}/$core_bin"
 fi
 
 cat >"$unit" <<'UNIT'
 [Unit]
-Description=Nowhere node agent
+Description=NWDock agent
 
 [Service]
-ExecStart=/usr/local/bin/nowhere-agent -config /etc/nowhere/agent.conf
+ExecStart=/opt/nwd-agent/bin/agent -config /opt/nwd-agent/agent.conf
 Restart=on-failure
 
 [Install]
@@ -323,21 +318,20 @@ chmod 0644 "$unit"
 umask 077
 {
   printf 'AGENT_RUNTIME=service\n'
-  printf 'AGENT_DATA_DIR=/var/lib/nowhere-agent\n'
+  printf 'AGENT_DATA_DIR=/opt/nwd-agent/data\n'
   printf 'AGENT_PANEL_ENDPOINTS=%s\n' "$AGENT_PANEL_ENDPOINTS"
   printf 'AGENT_PANEL_KEYPIN=%s\n' "$AGENT_PANEL_KEYPIN"
   printf 'AGENT_ENROLL_TOKEN=%s\n' "$AGENT_ENROLL_TOKEN"
   if [[ "$AGENT_CORE" == xray ]]; then
-    printf 'AGENT_XRAY_BIN=/usr/local/bin/xray\n'
+    printf 'AGENT_XRAY_BIN=/opt/nwd-agent/bin/xray\n'
     printf 'AGENT_XRAY_API_ADDR=127.0.0.1:10085\n'
   elif [[ "$AGENT_CORE" == singbox ]]; then
-    printf 'AGENT_SINGBOX_BIN=/usr/local/bin/sing-box\n'
+    printf 'AGENT_SINGBOX_BIN=/opt/nwd-agent/bin/sing-box\n'
   fi
 } >"$conf_file"
 chmod 0600 "$conf_file"
-rm -f "${etc_dir}/agent.env"
 
 if [[ -z "$prefix" ]]; then
   systemctl daemon-reload
-  systemctl enable --now nowhere-agent
+  systemctl enable --now /opt/nwd-agent/nwd-agent.service
 fi

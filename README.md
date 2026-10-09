@@ -24,7 +24,7 @@ cp .env.agent.example .env.agent
 GOWORK=off go run ./cmd/agent
 ```
 
-systemd 单元是 [`deploy/nowhere-agent.service`](./deploy/nowhere-agent.service)。服务形态执行 `nowhere-agent -config /etc/nowhere/agent.conf`，只认这份文件，不看进程环境。示例是 [`deploy/agent.conf.example`](./deploy/agent.conf.example)。Docker 与本目录 `.env.agent` 仍走环境变量。
+systemd 单元是 [`deploy/nwd-agent.service`](./deploy/nwd-agent.service)，放在 `/opt/nwd-agent/`。服务形态执行 `/opt/nwd-agent/bin/agent -config /opt/nwd-agent/agent.conf`，只认这份文件，不看进程环境。示例是 [`deploy/agent.conf.example`](./deploy/agent.conf.example)。Docker 安装同样用这份路径的 `-config`。本目录 `.env.agent` 仍走环境变量。
 
 ## 镜像
 
@@ -41,16 +41,16 @@ docker build -f deploy/Dockerfile.source \
   --build-arg "MIHOMO_TAG=${MIHOMO_TAG}" \
   --build-arg "SINGBOX_TAG=${SINGBOX_TAG}" \
   --build-arg "GEO_TAG=${GEO_TAG}" \
-  -t nowhere-agent:local .
+  -t nwdock-agent:local .
 ```
 
-`nowhere-agent`、`xray`、`sing-box` 三个文件已经在当前目录、不想在镜像里编译时，用 [`deploy/Dockerfile`](./deploy/Dockerfile)。它只复制这三个文件，不含 geo。mihomo 不需要单独的二进制：
+`agent`、`xray`、`sing-box` 三个文件已经在当前目录、不想在镜像里编译时，用 [`deploy/Dockerfile`](./deploy/Dockerfile)。它只复制这三个文件，不含 geo。mihomo 不需要单独的二进制：
 
 ```bash
-docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
+docker build -f <本仓库>/deploy/Dockerfile -t nwdock-agent:local .
 ```
 
-[`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 拉取 `ghcr.io/nwdock/nwdock-agent:latest`，不用上面的本地标签。它把 `/etc/nowhere/agent.conf` 只读挂进容器，启动参数是 `-config`。文件里写 `AGENT_RUNTIME=docker`，核心路径用镜像内的 `/usr/local/bin/xray` 和 `/usr/local/bin/sing-box`。要 xray 或 sing-box 时把 `image` 换成 `:xray` 或 `:singbox`。必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。安装命令走 [`deploy/install.sh`](./deploy/install.sh)，写出的就是这份配置和 compose。
+[`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 拉取 `ghcr.io/nwdock/nwdock-agent:latest`，不用上面的本地标签。它把 `/opt/nwd-agent/agent.conf` 只读挂进容器，入口自己执行 `/usr/local/bin/agent -config /opt/nwd-agent/agent.conf`。文件里写 `AGENT_RUNTIME=docker`，核心路径用镜像内的 `/usr/local/bin/xray` 和 `/usr/local/bin/sing-box`。数据目录是 `/opt/nwd-agent/data`。要 xray 或 sing-box 时把 `image` 换成 `:xray` 或 `:singbox`。必须 `network_mode: host`。不要写 `ports`，不要 `privileged`。能力只有 `NET_BIND_SERVICE`。安装命令走 [`deploy/install.sh`](./deploy/install.sh)，写出的就是这份配置和 compose。
 
 ## 发布
 
@@ -60,4 +60,4 @@ docker build -f <本仓库>/deploy/Dockerfile -t nowhere-agent:local .
 - `ghcr.io/nwdock/nwdock-agent:latest` 和 `ghcr.io/nwdock/nwdock-agent:<tag>`
 - `ghcr.io/nwdock/nwdock-agent:singbox` 和 `ghcr.io/nwdock/nwdock-agent:<tag>-singbox`
 
-`latest` 标签只有 agent。`xray` 和 `singbox` 标签额外带对应二进制，也可以在面板里切回内置核心。二进制 `nowhere-agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。发布镜像不走上面两个本地 Dockerfile。
+`latest` 标签只有 agent。`xray` 和 `singbox` 标签额外带对应二进制，也可以在面板里切回内置核心。二进制 `agent` 挂到该 tag 的 GitHub Release。`main` 上的提交不触发。发布镜像不走上面两个本地 Dockerfile。

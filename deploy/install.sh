@@ -56,16 +56,16 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
   die "需要 docker compose"
 fi
 
-etc_dir="${prefix}/etc/nowhere"
-data_dir="${prefix}/var/lib/nowhere-agent"
-conf_file="${etc_dir}/agent.conf"
-compose="${etc_dir}/docker-compose.yml"
+root_dir="${prefix}/opt/nwd-agent"
+data_dir="${root_dir}/data"
+conf_file="${root_dir}/agent.conf"
+compose="${root_dir}/docker-compose.yml"
 
-install -d -m 0700 "$etc_dir" "$data_dir"
+install -d -m 0700 "$root_dir" "$data_dir"
 umask 077
 {
   printf 'AGENT_RUNTIME=docker\n'
-  printf 'AGENT_DATA_DIR=/var/lib/nowhere-agent\n'
+  printf 'AGENT_DATA_DIR=/opt/nwd-agent/data\n'
   printf 'AGENT_PANEL_ENDPOINTS=%s\n' "$AGENT_PANEL_ENDPOINTS"
   printf 'AGENT_PANEL_KEYPIN=%s\n' "$AGENT_PANEL_KEYPIN"
   printf 'AGENT_ENROLL_TOKEN=%s\n' "$AGENT_ENROLL_TOKEN"
@@ -74,22 +74,23 @@ umask 077
   printf 'AGENT_SINGBOX_BIN=/usr/local/bin/sing-box\n'
 } >"$conf_file"
 chmod 0600 "$conf_file"
-rm -f "${etc_dir}/agent.env"
 
 cat >"$compose" <<EOF
+name: nwd-agent
 services:
   agent:
     image: ${image}
+    container_name: nwd-agent
     restart: unless-stopped
     network_mode: host
     cap_add:
       - NET_BIND_SERVICE
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - -config
-      - /etc/nowhere/agent.conf
+      - mkdir -p /opt/nwd-agent/data; if [ ! -f /opt/nwd-agent/data/geoip.dat ] && [ -f /usr/share/nowhere/geoip.dat ]; then cp /usr/share/nowhere/geoip.dat /opt/nwd-agent/data/geoip.dat; fi; if [ ! -f /opt/nwd-agent/data/geosite.dat ] && [ -f /usr/share/nowhere/geosite.dat ]; then cp /usr/share/nowhere/geosite.dat /opt/nwd-agent/data/geosite.dat; fi; exec /usr/local/bin/agent -config /opt/nwd-agent/agent.conf
     volumes:
-      - ${data_dir}:/var/lib/nowhere-agent
-      - ${conf_file}:/etc/nowhere/agent.conf:ro
+      - ${data_dir}:/opt/nwd-agent/data
+      - ${conf_file}:/opt/nwd-agent/agent.conf:ro
 EOF
 chmod 0600 "$compose"
 

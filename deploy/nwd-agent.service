@@ -1,0 +1,9 @@
+[Unit]
+Description=NWDock agent
+
+[Service]
+ExecStart=/opt/nwd-agent/bin/agent -config /opt/nwd-agent/agent.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

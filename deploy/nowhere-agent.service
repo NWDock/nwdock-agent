@@ -1,9 +1,0 @@
-[Unit]
-Description=Nowhere node agent
-
-[Service]
-ExecStart=/usr/local/bin/nowhere-agent -config /etc/nowhere/agent.conf
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target

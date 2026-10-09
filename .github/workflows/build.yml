@@ -51,11 +51,11 @@ jobs:
         run: |
           go build -trimpath \
             -ldflags "-X nowhere.local/agent/internal/agent.Version=${GITHUB_REF_NAME} -X github.com/metacubex/mihomo/constant.Version=${{ needs.versions.outputs.mihomo }}" \
-            -o nowhere-agent ./cmd/agent
+            -o agent ./cmd/agent
       - uses: actions/upload-artifact@v4
         with:
-          name: nowhere-agent
-          path: nowhere-agent
+          name: agent
+          path: agent
           if-no-files-found: error
 
   xray:
@@ -156,7 +156,7 @@ jobs:
         run: cp deploy/entrypoint.sh image/entrypoint.sh
       - name: Checksum agent
         working-directory: image
-        run: sha256sum nowhere-agent > SHA256SUMS
+        run: sha256sum agent > SHA256SUMS
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Build and push image
@@ -205,5 +205,5 @@ jobs:
               "${MIHOMO_TAG}" "${IMAGE_LATEST}" \
               "${SINGBOX_TAG}" "${IMAGE_SINGBOX}" \
               "${GEO_TAG}")" \
-            image/nowhere-agent \
+            image/agent \
             image/SHA256SUMS

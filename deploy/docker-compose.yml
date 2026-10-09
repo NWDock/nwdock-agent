@@ -1,16 +1,15 @@
+name: nwd-agent
 services:
   agent:
     image: ghcr.io/nwdock/nwdock-agent:latest
+    container_name: nwd-agent
     restart: unless-stopped
     network_mode: host
     cap_add:
       - NET_BIND_SERVICE
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - -config
-      - /etc/nowhere/agent.conf
+      - mkdir -p /opt/nwd-agent/data; if [ ! -f /opt/nwd-agent/data/geoip.dat ] && [ -f /usr/share/nowhere/geoip.dat ]; then cp /usr/share/nowhere/geoip.dat /opt/nwd-agent/data/geoip.dat; fi; if [ ! -f /opt/nwd-agent/data/geosite.dat ] && [ -f /usr/share/nowhere/geosite.dat ]; then cp /usr/share/nowhere/geosite.dat /opt/nwd-agent/data/geosite.dat; fi; exec /usr/local/bin/agent -config /opt/nwd-agent/agent.conf
     volumes:
-      - agent-data:/var/lib/nowhere-agent
-      - /etc/nowhere/agent.conf:/etc/nowhere/agent.conf:ro
-
-volumes:
-  agent-data:
+      - /opt/nwd-agent/data:/opt/nwd-agent/data
+      - /opt/nwd-agent/agent.conf:/opt/nwd-agent/agent.conf:ro

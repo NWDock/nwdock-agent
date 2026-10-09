@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-dest="${AGENT_DATA_DIR:-/var/lib/nowhere-agent}"
+dest="${AGENT_DATA_DIR:-/opt/nwd-agent/data}"
 src=/usr/share/nowhere
 mkdir -p "$dest"
 for name in geoip.dat geosite.dat; do
@@ -8,4 +8,4 @@ for name in geoip.dat geosite.dat; do
     cp "$src/$name" "$dest/$name"
   fi
 done
-exec /usr/local/bin/nowhere-agent
+exec /usr/local/bin/agent "$@"

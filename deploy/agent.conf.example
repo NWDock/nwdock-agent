@@ -1,11 +1,11 @@
 # 服务形态只读这个文件，不看进程环境。权限 0600 或 0400。
-# 复制：install -m 0600 deploy/agent.conf.example /etc/nowhere/agent.conf
+# 复制：install -m 0600 deploy/agent.conf.example /opt/nwd-agent/agent.conf
 AGENT_RUNTIME=service
-AGENT_DATA_DIR=/var/lib/nowhere-agent
+AGENT_DATA_DIR=/opt/nwd-agent/data
 AGENT_PANEL_ENDPOINTS=https://panel.example
 AGENT_PANEL_KEYPIN=change-me
 # 只在节点指纹未绑定时才需要，登记完成后删掉。
 # AGENT_ENROLL_TOKEN=change-me
-AGENT_XRAY_BIN=/usr/local/bin/xray
+AGENT_XRAY_BIN=/opt/nwd-agent/bin/xray
 AGENT_XRAY_API_ADDR=127.0.0.1:10085
-AGENT_SINGBOX_BIN=/usr/local/bin/sing-box
+AGENT_SINGBOX_BIN=/opt/nwd-agent/bin/sing-box

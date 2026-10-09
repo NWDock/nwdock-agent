@@ -19,7 +19,7 @@ COPY . .
 ARG VERSION
 RUN CGO_ENABLED=0 GOWORK=off go build -trimpath \
     -ldflags "-X nowhere.local/agent/internal/agent.Version=${VERSION} -X github.com/metacubex/mihomo/constant.Version=${MIHOMO_TAG}" \
-    -o /out/nowhere-agent ./cmd/agent
+    -o /out/agent ./cmd/agent
 
 # Xray 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
 FROM golang:1.27-alpine AS xray
@@ -64,8 +64,8 @@ ARG GEO_TAG=202610052207
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /usr/share/nowhere /var/lib/nowhere-agent
-COPY --from=agent /out/nowhere-agent /usr/local/bin/nowhere-agent
+    && mkdir -p /usr/share/nowhere /opt/nwd-agent/data
+COPY --from=agent /out/agent /usr/local/bin/agent
 COPY --from=xray /out/xray /usr/local/bin/xray
 COPY --from=singbox /out/sing-box /usr/local/bin/sing-box
 COPY --from=geo /out/geoip.dat /out/geosite.dat /usr/share/nowhere/
@@ -81,9 +81,9 @@ LABEL org.opencontainers.image.source="https://github.com/NWDock/nwdock-agent" \
       org.opencontainers.image.revision.sing-box="${SINGBOX_TAG}" \
       org.opencontainers.image.revision.geo="${GEO_TAG}"
 ENV AGENT_RUNTIME=docker \
-    AGENT_DATA_DIR=/var/lib/nowhere-agent \
+    AGENT_DATA_DIR=/opt/nwd-agent/data \
     XRAY_BIN=/usr/local/bin/xray \
     XRAY_API_ADDR=127.0.0.1:10085 \
     SINGBOX_BIN=/usr/local/bin/sing-box
-VOLUME ["/var/lib/nowhere-agent"]
+VOLUME ["/opt/nwd-agent/data"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

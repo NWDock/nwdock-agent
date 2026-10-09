@@ -12,10 +12,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /usr/share/nowhere /var/lib/nowhere-agent
-COPY nowhere-agent /usr/local/bin/nowhere-agent
+COPY agent /usr/local/bin/agent
 COPY geoip.dat geosite.dat /usr/share/nowhere/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/nowhere-agent \
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/agent \
     && printf 'xray=%s\nmihomo=%s\nsing-box=%s\ngeo=%s\nagent=%s\n' \
         "${XRAY_TAG}" "${MIHOMO_TAG}" "${SINGBOX_TAG}" "${GEO_TAG}" "${VERSION}" \
         > /usr/share/nowhere/cores.txt
