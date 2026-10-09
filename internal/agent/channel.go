@@ -195,6 +195,7 @@ func (s *session) sendHeartbeat(ctx context.Context) error {
 		"generation":   appliedGeneration(s.cfg.DataDir),
 		"error":        errorSummary(),
 		"image":        s.cfg.Image,
+		"relay":        relayStates(),
 	})
 	if err != nil {
 		return err

@@ -171,6 +171,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	// 转发引擎与通道、核心都解耦：先按磁盘上最后一份清单把入口端口听起来，
+	// 面板连上后由 desired 驱动增删；面板失联也不影响转发。
+	relayInit(cfg.DataDir)
+	defer relayStop()
 	backoff := time.Second
 	tokenRetried := false
 	if cfg.fromFile {
