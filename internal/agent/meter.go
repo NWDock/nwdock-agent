@@ -106,23 +106,23 @@ func (meterTunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	if metadata != nil {
 		inbound = metadata.InName
 	}
-	key, acc, rate, ctr, ok := traffic.accept(metadata)
+	key, acc, rate, ctr, inCtr, ok := traffic.accept(metadata)
 	if !ok {
 		_ = conn.Close()
 		return
 	}
-	wrapped := &meterConn{m: traffic, Conn: conn, acc: acc, key: key, rate: rate, ctr: ctr, inbound: inbound}
+	wrapped := &meterConn{m: traffic, Conn: conn, acc: acc, key: key, rate: rate, ctr: ctr, inCtr: inCtr, inbound: inbound}
 	traffic.track(acc, wrapped, inbound)
 	tunnel.Tunnel.HandleTCPConn(wrapped, metadata)
 }
 
 func (meterTunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
-	key, acc, rate, ctr, ok := traffic.accept(metadata)
+	key, acc, rate, ctr, inCtr, ok := traffic.accept(metadata)
 	if !ok {
 		packet.Drop()
 		return
 	}
-	base := &meterPacket{m: traffic, UDPPacket: packet, acc: acc, rate: rate, ctr: ctr, key: key}
+	base := &meterPacket{m: traffic, UDPPacket: packet, acc: acc, rate: rate, ctr: ctr, inCtr: inCtr, key: key}
 	var out C.UDPPacket = base
 	if in, ok := packet.(C.UDPPacketInAddr); ok {
 		out = &meterPacketIn{meterPacket: base, in: in.InAddr()}
@@ -146,7 +146,9 @@ func quotaKeyOf(md *C.Metadata) string {
 }
 
 // accept 决定这条连接能否进入隧道，并返回缓存用的账户与计数器。
-func (m *trafficMeter) accept(md *C.Metadata) (string, *meterAccount, int64, *rawCounter, bool) {
+// 第二个计数器是共享监听器的入站级辅助计数（计费仍只按 user>>> 键），
+// 只统计、不影响准入与配额。
+func (m *trafficMeter) accept(md *C.Metadata) (string, *meterAccount, int64, *rawCounter, *rawCounter, bool) {
 	key := quotaKeyOf(md)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -155,21 +157,31 @@ func (m *trafficMeter) accept(md *C.Metadata) (string, *meterAccount, int64, *ra
 	ref, known := m.keys[key]
 	if key == "" || !known {
 		if m.mode == "loose" || open {
-			return key, nil, 100, m.counterLocked(key), true
+			return key, nil, 100, m.counterLocked(key), m.sharedInboundCounterLocked(md), true
 		}
-		return key, nil, 0, nil, false
+		return key, nil, 0, nil, nil, false
 	}
 	acc := m.accounts[ref.sub]
 	if acc == nil {
-		return key, nil, 0, nil, false
+		return key, nil, 0, nil, nil, false
 	}
 	if acc.unlimited || open {
-		return key, acc, ref.rate, m.counterLocked(key), true
+		return key, acc, ref.rate, m.counterLocked(key), m.sharedInboundCounterLocked(md), true
 	}
 	if m.expiredLocked() || acc.granted.Load() <= acc.used.Load() {
-		return key, acc, ref.rate, m.counterLocked(key), false
+		return key, acc, ref.rate, m.counterLocked(key), nil, false
 	}
-	return key, acc, ref.rate, m.counterLocked(key), true
+	return key, acc, ref.rate, m.counterLocked(key), m.sharedInboundCounterLocked(md), true
+}
+
+// sharedInboundCounterLocked 给共享监听器的连接附加入站级计数器：计费键是
+// user>>>，按节点统计实际流量需要 inbound>>><监听名>。Nowhere 连接没有
+// InUser、键本身就是入站级，不再需要第二个计数器。
+func (m *trafficMeter) sharedInboundCounterLocked(md *C.Metadata) *rawCounter {
+	if md == nil || md.InUser == "" || md.InName == "" {
+		return nil
+	}
+	return m.counterLocked("inbound>>>" + md.InName)
 }
 
 func (m *trafficMeter) counterLocked(key string) *rawCounter {
@@ -450,7 +462,29 @@ type meterConn struct {
 	key     string
 	rate    int64
 	ctr     *rawCounter
+	inCtr   *rawCounter
 	inbound string
+}
+
+// note 同时累加计费键与入站级辅助计数器（只有共享协议连接带 inCtr）。
+func (c *meterConn) note(n int64, upload bool) {
+	if n <= 0 {
+		return
+	}
+	if c.ctr != nil {
+		if upload {
+			c.ctr.up.Add(n)
+		} else {
+			c.ctr.down.Add(n)
+		}
+	}
+	if c.inCtr != nil {
+		if upload {
+			c.inCtr.up.Add(n)
+		} else {
+			c.inCtr.down.Add(n)
+		}
+	}
 }
 
 func (c *meterConn) ReadBuffer(buffer *buf.Buffer) error {
@@ -497,9 +531,7 @@ func (c *meterConn) Write(p []byte) (int, error) {
 	if gap := allow - int64(n); gap > 0 {
 		refund(c.acc, gap, c.rate)
 	}
-	if n > 0 && c.ctr != nil {
-		c.ctr.down.Add(int64(n))
-	}
+	c.note(int64(n), false)
 	if allow < int64(len(p)) {
 		c.m.trip(c.acc)
 		return n, net.ErrClosed
@@ -515,13 +547,7 @@ func (c *meterConn) consume(n int64, err error, upload bool) (int, error) {
 		return int(n), err
 	}
 	allow := admit(c.acc, n, c.rate, c.acc != nil)
-	if allow > 0 && c.ctr != nil {
-		if upload {
-			c.ctr.up.Add(allow)
-		} else {
-			c.ctr.down.Add(allow)
-		}
-	}
+	c.note(allow, upload)
 	if allow < n {
 		c.m.trip(c.acc)
 		if allow == 0 {
@@ -537,13 +563,7 @@ func (c *meterConn) noteLoose(n int64, upload bool) {
 	if n <= 0 {
 		return
 	}
-	if c.ctr != nil {
-		if upload {
-			c.ctr.up.Add(n)
-		} else {
-			c.ctr.down.Add(n)
-		}
-	}
+	c.note(n, upload)
 	if c.acc == nil || c.acc.unlimited {
 		return
 	}
@@ -566,8 +586,30 @@ type meterPacket struct {
 	acc     *meterAccount
 	rate    int64
 	ctr     *rawCounter
+	inCtr   *rawCounter
 	key     string
 	counted atomic.Bool
+}
+
+// note 同时累加计费键与入站级辅助计数器（只有共享协议连接带 inCtr）。
+func (p *meterPacket) note(n int64, upload bool) {
+	if n <= 0 {
+		return
+	}
+	if p.ctr != nil {
+		if upload {
+			p.ctr.up.Add(n)
+		} else {
+			p.ctr.down.Add(n)
+		}
+	}
+	if p.inCtr != nil {
+		if upload {
+			p.inCtr.up.Add(n)
+		} else {
+			p.inCtr.down.Add(n)
+		}
+	}
 }
 
 func (p *meterPacket) Data() []byte {
@@ -599,13 +641,7 @@ func (p *meterPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
 
 func (p *meterPacket) charge(raw int64, upload bool) int64 {
 	if p.m.looseBypass() {
-		if p.ctr != nil && raw > 0 {
-			if upload {
-				p.ctr.up.Add(raw)
-			} else {
-				p.ctr.down.Add(raw)
-			}
-		}
+		p.note(raw, upload)
 		if p.acc != nil && !p.acc.unlimited && raw > 0 {
 			rate := p.rate
 			if rate <= 0 {
@@ -621,13 +657,7 @@ func (p *meterPacket) charge(raw int64, upload bool) int64 {
 		p.m.trip(p.acc)
 		return 0
 	}
-	if allow > 0 && p.ctr != nil {
-		if upload {
-			p.ctr.up.Add(allow)
-		} else {
-			p.ctr.down.Add(allow)
-		}
-	}
+	p.note(allow, upload)
 	p.m.maybeSignal(p.acc)
 	return allow
 }
