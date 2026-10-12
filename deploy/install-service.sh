@@ -1,6 +1,7 @@
 #!/bin/sh
 # 与 panel/internal/panel/install-service.sh 必须逐字相同。对照：scripts/check-embedded-copies.sh
-# 由面板安装命令以环境变量调用。NWDOCK_INSTALL_PREFIX、NWDOCK_*_API、NWDOCK_*_URL 只用于测试。
+# 四个 AGENT_* 都有时直接用。缺了则用两个参数向面板领取指纹和核心，不核销令牌。
+# NWDOCK_INSTALL_PREFIX、NWDOCK_*_API、NWDOCK_*_URL 只用于测试。
 set -eu
 
 die() {
@@ -514,6 +515,50 @@ extract_singbox() {
   read_entries "$member" "$tmp/entries" || die "压缩包里没有 sing-box"
   tar -xOzf "$archive" "$member" >"$dest"
 }
+
+load_install_spec() {
+  local endpoint token payload spec keypin core
+  endpoint=$1
+  token=$2
+  if [ -z "$endpoint" ] || [ -z "$token" ]; then
+    require AGENT_PANEL_ENDPOINTS "${AGENT_PANEL_ENDPOINTS:-}"
+    require AGENT_PANEL_KEYPIN "${AGENT_PANEL_KEYPIN:-}"
+    require AGENT_ENROLL_TOKEN "${AGENT_ENROLL_TOKEN:-}"
+    require AGENT_CORE "${AGENT_CORE:-}"
+    return 0
+  fi
+  valid_endpoint "$endpoint" || die "AGENT_PANEL_ENDPOINTS 必须是 http(s)://主机[:端口]"
+  valid_hex64 "$token" || die "AGENT_ENROLL_TOKEN 必须是 64 位十六进制"
+  command -v curl >/dev/null 2>&1 || die "需要 curl"
+  payload=$(printf '{"token":"%s"}' "$token")
+  spec=$(curl -fsSL --max-time 30 -X POST -H "Content-Type: application/json" --data "$payload" "${endpoint}/api/agent/install-spec") || die "无法读取安装参数"
+  spec=$(printf '%s' "$spec" | tr -d '\r')
+  case "$spec" in
+    *"$nl"*|*"$tab"*) die "无法读取安装参数" ;;
+  esac
+  keypin=${spec%% *}
+  core=${spec#* }
+  if [ "$core" = "$spec" ] || [ -z "$core" ]; then
+    die "无法读取安装参数"
+  fi
+  case "$core" in
+    *" "*) die "无法读取安装参数" ;;
+  esac
+  valid_hex64 "$keypin" || die "无法读取安装参数"
+  case "$core" in
+    clash-meta-nw|mihomo|xray|singbox) ;;
+    *) die "无法读取安装参数" ;;
+  esac
+  AGENT_PANEL_ENDPOINTS=$endpoint
+  AGENT_PANEL_KEYPIN=$keypin
+  AGENT_ENROLL_TOKEN=$token
+  AGENT_CORE=$core
+  export AGENT_PANEL_ENDPOINTS AGENT_PANEL_KEYPIN AGENT_ENROLL_TOKEN AGENT_CORE
+}
+
+if [ -z "${AGENT_PANEL_ENDPOINTS:-}" ] || [ -z "${AGENT_PANEL_KEYPIN:-}" ] || [ -z "${AGENT_ENROLL_TOKEN:-}" ] || [ -z "${AGENT_CORE:-}" ]; then
+  load_install_spec "${1:-}" "${2:-}"
+fi
 
 require AGENT_PANEL_ENDPOINTS "${AGENT_PANEL_ENDPOINTS:-}"
 require AGENT_PANEL_KEYPIN "${AGENT_PANEL_KEYPIN:-}"
