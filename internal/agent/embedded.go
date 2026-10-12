@@ -133,7 +133,8 @@ func applyMihomo(cfg *config.Config) (err error) {
 	return nil
 }
 
-// absolutizeMihomo 把监听器与出站里的证书相对路径改成数据目录下的绝对路径。
+// absolutizeMihomo 把成对的证书相对路径改成数据目录下的绝对路径。
+// 只有 private-key、没有 certificate 的字段是密钥正文（WireGuard），不改。
 func absolutizeMihomo(configRaw []byte, dir string) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(configRaw, &doc); err != nil {
@@ -148,16 +149,20 @@ func absolutizeMihomo(configRaw []byte, dir string) ([]byte, error) {
 func walkMihomoPaths(node any, dir string) error {
 	switch item := node.(type) {
 	case map[string]any:
-		for _, key := range []string{"certificate", "private-key"} {
-			value, _ := item[key].(string)
-			if value == "" || filepath.IsAbs(value) {
-				continue
+		cert, _ := item["certificate"].(string)
+		key, _ := item["private-key"].(string)
+		if cert != "" && key != "" {
+			for _, field := range []string{"certificate", "private-key"} {
+				value, _ := item[field].(string)
+				if value == "" || filepath.IsAbs(value) {
+					continue
+				}
+				abs, err := safeJoin(dir, value)
+				if err != nil {
+					return err
+				}
+				item[field] = abs
 			}
-			abs, err := safeJoin(dir, value)
-			if err != nil {
-				return err
-			}
-			item[key] = abs
 		}
 		for _, child := range item {
 			if err := walkMihomoPaths(child, dir); err != nil {

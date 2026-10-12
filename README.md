@@ -24,7 +24,7 @@ cp .env.agent.example .env.agent
 GOWORK=off go run ./cmd/agent
 ```
 
-systemd 单元是 [`deploy/nwd-agent.service`](./deploy/nwd-agent.service)，放在 `/opt/nwd-agent/`。服务形态执行 `/opt/nwd-agent/bin/agent -config /opt/nwd-agent/agent.conf`，只认这份文件，不看进程环境。示例是 [`deploy/agent.conf.example`](./deploy/agent.conf.example)。Docker 安装同样用这份路径的 `-config`。本目录 `.env.agent` 仍走环境变量。
+systemd 单元是 [`deploy/nwd-agent.service`](./deploy/nwd-agent.service)，OpenRC 脚本是 [`deploy/nwd-agent.initd`](./deploy/nwd-agent.initd)，都放在 `/opt/nwd-agent/`。服务形态执行 `/opt/nwd-agent/bin/agent -config /opt/nwd-agent/agent.conf`，只认这份文件，不看进程环境。示例是 [`deploy/agent.conf.example`](./deploy/agent.conf.example)。Docker 安装同样用这份路径的 `-config`。本目录 `.env.agent` 仍走环境变量。
 
 ## 镜像
 

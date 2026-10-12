@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -67,5 +68,36 @@ func TestAbsolutizeCerts(t *testing.T) {
 	}
 	if strings.Contains(text, `"certificateFile": "certs/`) {
 		t.Fatalf("relative certificate path left in %s", text)
+	}
+}
+
+func TestAbsolutizeMihomo(t *testing.T) {
+	const wgKey = "oI/4kH8vN2pQ6sT0uW4yA8cE1gJ5mL9nR3bD7fH0iK="
+	config := []byte(`{"listeners":[{"name":"nw","certificate":"certs/n/fullchain.pem","private-key":"certs/n/key.pem"}],"proxies":[{"name":"warp","type":"wireguard","private-key":"` + wgKey + `"}]}`)
+	out, err := absolutizeMihomo(config, "/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Listeners []struct {
+			Certificate string `json:"certificate"`
+			PrivateKey  string `json:"private-key"`
+		} `json:"listeners"`
+		Proxies []struct {
+			Type       string `json:"type"`
+			PrivateKey string `json:"private-key"`
+		} `json:"proxies"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Listeners) != 1 || len(doc.Proxies) != 1 {
+		t.Fatalf("%s", out)
+	}
+	if doc.Listeners[0].Certificate != "/data/certs/n/fullchain.pem" || doc.Listeners[0].PrivateKey != "/data/certs/n/key.pem" {
+		t.Fatalf("listener certs: %+v", doc.Listeners[0])
+	}
+	if doc.Proxies[0].Type != "wireguard" || doc.Proxies[0].PrivateKey != wgKey {
+		t.Fatalf("wireguard key changed: %s", doc.Proxies[0].PrivateKey)
 	}
 }

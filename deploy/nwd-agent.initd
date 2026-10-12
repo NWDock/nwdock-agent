@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+
+name="nwd-agent"
+description="NWDock agent"
+supervisor=supervise-daemon
+command="/opt/nwd-agent/bin/agent"
+command_args="-config /opt/nwd-agent/agent.conf"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need net
+}
