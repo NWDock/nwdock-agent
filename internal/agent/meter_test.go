@@ -136,33 +136,35 @@ func TestMeterSharedInboundDualCount(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
 	acc := mustGrant(t, m, grantJSON("s1", 1000, 100, "user>>>u1", "strict"))
-	key, gotAcc, rate, ctr, inCtr, ok := m.accept(&C.Metadata{InUser: "u1", InName: "sh-ss-21003"})
+	key, gotAcc, rate, ctr, inCtr, pairCtr, ok := m.accept(&C.Metadata{InUser: "u1", InName: "sh-ss-21003"})
 	if !ok || key != "user>>>u1" || gotAcc != acc || rate != 100 {
 		t.Fatalf("accept: ok %v key %q acc %v rate %d", ok, key, gotAcc == acc, rate)
 	}
-	if inCtr == nil {
-		t.Fatal("shared listener must get an inbound-level counter")
+	if inCtr == nil || pairCtr == nil {
+		t.Fatal("shared listener must get an inbound-level counter and a user×inbound pair counter")
 	}
 	peer, local := net.Pipe()
 	defer peer.Close()
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: rate, ctr: ctr, inCtr: inCtr}
+	conn := &meterConn{m: m, Conn: local, acc: acc, rate: rate, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr}
 	if _, err := conn.Write(make([]byte, 400)); err != nil {
 		t.Fatal(err)
 	}
-	if ctr.down.Load() != 400 || inCtr.down.Load() != 400 {
-		t.Fatalf("dual count: user %d inbound %d", ctr.down.Load(), inCtr.down.Load())
+	if ctr.down.Load() != 400 || inCtr.down.Load() != 400 || pairCtr.down.Load() != 400 {
+		t.Fatalf("dual count: user %d inbound %d pair %d", ctr.down.Load(), inCtr.down.Load(), pairCtr.down.Load())
 	}
 	if acc.used.Load() != 400 {
 		t.Fatalf("billing must count once, used %d", acc.used.Load())
 	}
-	// Nowhere 连接没有 InUser，键本身就是入站级，不再带第二个计数器。
-	if _, _, _, _, nwIn, _ := m.accept(&C.Metadata{InName: "nw-abcd1234-20000"}); nwIn != nil {
+	// Nowhere 连接没有 InUser，键本身就是入站级，不再带辅助计数器。
+	if _, _, _, _, nwIn, nwPair, _ := m.accept(&C.Metadata{InName: "nw-abcd1234-20000"}); nwIn != nil || nwPair != nil {
 		t.Fatal("nowhere conn must not dual count")
 	}
-	// 计费键与入站级键都随 stats 上报，面板各取所需。
+	// 计费键、入站级键与联合键都随 stats 上报，面板各取所需。
 	counters := m.counters()
-	if counters["user>>>u1>>>traffic>>>downlink"] != 400 || counters["inbound>>>sh-ss-21003>>>traffic>>>downlink"] != 400 {
+	if counters["user>>>u1>>>traffic>>>downlink"] != 400 ||
+		counters["inbound>>>sh-ss-21003>>>traffic>>>downlink"] != 400 ||
+		counters["pair>>>u1>>>sh-ss-21003>>>traffic>>>downlink"] != 400 {
 		t.Fatalf("counters: %v", counters)
 	}
 }
@@ -223,16 +225,16 @@ func TestMeterStrictRejectsUnknownLooseAllows(t *testing.T) {
 	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "other"}); ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "other"}); ok {
 		t.Fatal("strict mode must reject an unknown key")
 	}
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
 		t.Fatal("known key must pass")
 	}
 	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "loose"))); err != nil {
 		t.Fatal(err)
 	}
-	key, acc, _, _, _, ok := m.accept(&C.Metadata{InName: "other"})
+	key, acc, _, _, _, _, ok := m.accept(&C.Metadata{InName: "other"})
 	if !ok || acc != nil || key != "inbound>>>other" {
 		t.Fatalf("loose unknown: ok %v acc %v key %q", ok, acc != nil, key)
 	}
@@ -243,7 +245,7 @@ func TestMeterExpiryEpochTopUp(t *testing.T) {
 	m := testMeter(&now)
 	acc := mustGrant(t, m, grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))
 	acc.used.Store(100)
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
 		t.Fatal("exhausted grant must reject")
 	}
 	if err := m.ApplySnapshot([]byte(`{"epoch":"e1","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s1","granted":250,"keys":{"inbound>>>nw":100}}]}`)); err != nil {
@@ -252,11 +254,11 @@ func TestMeterExpiryEpochTopUp(t *testing.T) {
 	if acc.used.Load() != 100 || acc.granted.Load() != 250 {
 		t.Fatalf("top-up used %d granted %d", acc.used.Load(), acc.granted.Load())
 	}
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
 		t.Fatal("top-up must reopen")
 	}
 	now = now.Add(571 * time.Second)
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
 		t.Fatal("expired grant must reject")
 	}
 	acc.used.Store(40)
@@ -266,7 +268,7 @@ func TestMeterExpiryEpochTopUp(t *testing.T) {
 	if acc.used.Load() != 0 || acc.granted.Load() != 100 {
 		t.Fatalf("new epoch used %d granted %d", acc.used.Load(), acc.granted.Load())
 	}
-	if _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
+	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
 		t.Fatal("new epoch must pass")
 	}
 }
