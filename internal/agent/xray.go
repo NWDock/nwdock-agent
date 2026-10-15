@@ -57,7 +57,7 @@ type ruleSetDesired struct {
 
 // validAssetName 只接受两类资产：xray/mihomo 的 .dat 与 sing-box 的 <tag>.srs 规则集。
 func validAssetName(name string) bool {
-	if name == "geoip.dat" || name == "geosite.dat" {
+	if name == "geoip.dat" || name == "geosite.dat" || name == "ASN.mmdb" {
 		return true
 	}
 	tag, ok := strings.CutSuffix(name, ".srs")

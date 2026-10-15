@@ -63,12 +63,12 @@ func TestSyncAssetsSkipAndReject(t *testing.T) {
 }
 
 func TestValidAssetName(t *testing.T) {
-	for _, ok := range []string{"geoip.dat", "geosite.dat", "cn.srs", "category-ads-all.srs", "a.srs", "0ab-1.srs"} {
+	for _, ok := range []string{"geoip.dat", "geosite.dat", "ASN.mmdb", "cn.srs", "category-ads-all.srs", "a.srs", "0ab-1.srs"} {
 		if !validAssetName(ok) {
 			t.Fatalf("%s should be valid", ok)
 		}
 	}
-	for _, bad := range []string{"evil.dat", "geo.dat", ".srs", "-cn.srs", "CN.srs", "cn_srs", "cn.SRS", "../evil.srs", "rule-sets/cn.srs", "cn.tar", ""} {
+	for _, bad := range []string{"evil.dat", "geo.dat", "asn.mmdb", ".srs", "-cn.srs", "CN.srs", "cn_srs", "cn.SRS", "../evil.srs", "rule-sets/cn.srs", "cn.tar", ""} {
 		if validAssetName(bad) {
 			t.Fatalf("%s should be invalid", bad)
 		}
