@@ -37,6 +37,7 @@ listeners:
     listen: 127.0.0.1
     port: %d
     password: %s
+    alpn: [nw2]
 rules:
   - MATCH,DIRECT
 `, port, quotaTestPassword)
@@ -56,10 +57,70 @@ rules:
 		t.Fatal(err)
 	}
 
+	client, err := outbound.NewNowhereV2(outbound.NowhereOption{
+		Name: "c", Server: "127.0.0.1", Port: port,
+		Password: quotaTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw2"},
+		Up:   "tcp", Down: "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeUntilStop(t, conn, push)
+	_ = conn.Close()
+	waitSink(t, sink, grant)
+	if used := billed("s"); used != grant {
+		t.Fatalf("billed %d want %d counters %v", used, grant, traffic.counters())
+	}
+}
+
+// nw3 默认栈：监听不写 alpn（核心默认 nw3），客户端同样不写 up/down，配额截断口径不变。
+func TestEmbeddedNowhereNw3CutsAtGrant(t *testing.T) {
+	const grant int64 = 4 << 20
+	const push int64 = 10 << 20
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	sink, sinkPort := listenSink(t)
+	port := freePort(t)
+	dir := t.TempDir()
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw3
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+rules:
+  - MATCH,DIRECT
+`, port, quotaTestPassword)
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), path, dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Stop)
+	if err := traffic.ApplySnapshot([]byte(fmt.Sprintf(
+		`{"epoch":"e","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s","granted":%d,"keys":{"inbound>>>nw3":100}}]}`,
+		grant,
+	))); err != nil {
+		t.Fatal(err)
+	}
+
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
 		Name: "c", Server: "127.0.0.1", Port: port,
 		Password: quotaTestPassword, SkipCertVerify: true,
-		Up: "tcp", Down: "tcp",
 	})
 	if err != nil {
 		t.Fatal(err)
