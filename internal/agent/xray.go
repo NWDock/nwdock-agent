@@ -91,8 +91,12 @@ func syncAssets(ctx context.Context, cfg Config, entries []geoDesired) (bool, er
 		if want == "" {
 			return changed, fmt.Errorf("asset %s missing sha256", entry.Name)
 		}
+		target := filepath.Join(cfg.DataDir, filepath.FromSlash(entry.Name))
 		if have, err := os.ReadFile(filepath.Join(cfg.DataDir, assetSidecar(entry.Name))); err == nil && strings.TrimSpace(string(have)) == want {
-			continue
+			// 侧车命中但文件没了（误删/被清理）要自愈重拉，否则核会回落到自行下载的旧数据。
+			if _, err := os.Stat(target); err == nil {
+				continue
+			}
 		}
 		data, err := fetchAsset(ctx, cfg, entry)
 		if err != nil {
@@ -102,7 +106,6 @@ func syncAssets(ctx context.Context, cfg Config, entries []geoDesired) (bool, er
 		if hex.EncodeToString(sum[:]) != want {
 			return changed, fmt.Errorf("asset %s sha256 mismatch", entry.Name)
 		}
-		target := filepath.Join(cfg.DataDir, filepath.FromSlash(entry.Name))
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return changed, err
 		}
@@ -119,7 +122,37 @@ func syncAssets(ctx context.Context, cfg Config, entries []geoDesired) (bool, er
 		changed = true
 		fmt.Println("geo", entry.Name)
 	}
+	if dropCaseTwins(cfg.DataDir, entries) {
+		changed = true
+	}
 	return changed, nil
+}
+
+// dropCaseTwins 删掉面板已下发资产的大小写孪生副本，返回是否有删除。
+// 内置 mihomo 用 EqualFold 扫数据目录定位 GeoSite/GeoIP，os.ReadDir 字典序大写在前，
+// 陈旧的 GeoSite.dat/GeoIP.dat（核自行下载的 MetaCubeX 版）会遮蔽面板下发的小写文件，
+// china-list 这类只存在于 Loyalsoldier 数据里的类别就会报 not found。
+// 只删已下发精确名对应文件的异体名，清单外文件一律不碰。
+func dropCaseTwins(dir string, entries []geoDesired) bool {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	removed := false
+	for _, entry := range entries {
+		for _, fi := range files {
+			if fi.IsDir() || fi.Name() == entry.Name || !strings.EqualFold(fi.Name(), entry.Name) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
+				fmt.Fprintf(os.Stderr, "geo twin %s: %v\n", fi.Name(), err)
+				continue
+			}
+			fmt.Println("geo twin", fi.Name())
+			removed = true
+		}
+	}
+	return removed
 }
 
 func assetFetchPath(name string) string {

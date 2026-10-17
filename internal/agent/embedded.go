@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
@@ -53,8 +54,14 @@ func (e *embeddedRuntime) Start(ctx context.Context, configPath, dir string) err
 	return nil
 }
 
-func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, _ []sharedDesired, _, _ bool) error {
+func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, _ []sharedDesired, geoChanged, _ bool) error {
 	C.SetHomeDir(dir)
+	if geoChanged {
+		// geo 资产有变（内容更新或大小写孪生清理）时清掉核内匹配缓存：
+		// singleflight 只按类别名缓存，不清会把旧文件的内容留到进程重启。
+		geodata.ClearGeoSiteCache()
+		geodata.ClearGeoIPCache()
+	}
 	cfg, err := parseMihomoFile(configPath)
 	if err != nil {
 		return err
