@@ -16,7 +16,8 @@ import (
 )
 
 // relaySpec 与 panel 侧 RelaySpec 逐字一致：desired.relays 下发的单条入口转发指令。
-// 入口端口把客户端流量原样转到落地节点的入站端口：不解密、不终结 TLS、不计流量。
+// 入口端口把客户端流量原样转到落地节点的入站端口：不解密、不终结 TLS。
+// 转发字节只进机器整机限额，不进用户、节点或全站统计。
 type relaySpec struct {
 	Port       int    `json:"port"`
 	TargetHost string `json:"target_host"`
@@ -70,15 +71,90 @@ type relayUDPSession struct {
 
 func (s *relayUDPSession) closeConn() { s.once.Do(func() { _ = s.up.Close() }) }
 
-// relayEngine 按面板清单维护入口端口：只开、关有变化的端口，已建立的连接保持。
-type relayEngine struct {
-	mu      sync.Mutex
-	dir     string
-	ports   map[int]*relayHandle
-	persist []relaySpec // 最近一次落盘的清单，用于跳过无变化的写盘
+// relayTraffic 是入口转发的进程级累计实际字节：uplink 为客户端写入落地，
+// downlink 为落地写回客户端。只按成功写入计数，面板用水位差累计机器本期用量。
+type relayTraffic struct {
+	up   atomic.Int64
+	down atomic.Int64
 }
 
-var relayEng = &relayEngine{ports: map[int]*relayHandle{}}
+func (t *relayTraffic) note(n int64, upload bool) {
+	if n <= 0 {
+		return
+	}
+	if upload {
+		t.up.Add(n)
+		return
+	}
+	t.down.Add(n)
+}
+
+func (t *relayTraffic) counters() map[string]int64 {
+	out := map[string]int64{}
+	if v := t.up.Load(); v > 0 {
+		out["relay>>>all>>>traffic>>>uplink"] = v
+	}
+	if v := t.down.Load(); v > 0 {
+		out["relay>>>all>>>traffic>>>downlink"] = v
+	}
+	return out
+}
+
+var relayBytes = &relayTraffic{}
+
+func relayNote(n int64, upload bool) {
+	relayBytes.note(n, upload)
+}
+
+// relayWakeStats 在连接/会话结束后唤醒合并上报；字节已实时入账，这里不再加尾量。
+func relayWakeStats() {
+	traffic.signal()
+}
+
+func relayCounters() map[string]int64 {
+	return relayBytes.counters()
+}
+
+// relayCountingWriter 只计实际写入落地的字节，读取后没写出去的尾部不计。
+type relayCountingWriter struct {
+	dst    io.Writer
+	upload bool
+}
+
+func (w relayCountingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 {
+		relayBytes.note(int64(n), w.upload)
+	}
+	return n, err
+}
+
+// relayTCPSession 是一条按入口端口登记的 TCP 转发会话；端口撤销时关闭两端。
+type relayTCPSession struct {
+	port     int
+	client   net.Conn
+	upstream net.Conn
+	once     sync.Once
+}
+
+func (s *relayTCPSession) closeConns() {
+	s.once.Do(func() {
+		_ = s.client.Close()
+		_ = s.upstream.Close()
+	})
+}
+
+// relayEngine 按面板清单维护入口端口：只开、关有变化的端口，端口撤销时关闭会话，
+// 同端口仅目标变化时保留已建立的 TCP 连接。
+type relayEngine struct {
+	mu          sync.Mutex
+	dir         string
+	ports       map[int]*relayHandle
+	tcpSessions map[int]map[*relayTCPSession]struct{}
+	persist     []relaySpec // 最近一次落盘的清单，用于跳过无变化的写盘
+}
+
+var relayEng = &relayEngine{ports: map[int]*relayHandle{}, tcpSessions: map[int]map[*relayTCPSession]struct{}{}}
 
 func (sp relaySpec) valid() bool {
 	return sp.Port >= 1 && sp.Port <= 65535 &&
@@ -97,7 +173,7 @@ func relayInit(dir string) {
 	relayEng.mu.Unlock()
 	specs, err := readRelayWant(dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		logf(levelWarning, "%s", err.Error())
 	}
 	relayEng.apply(specs)
 }
@@ -141,7 +217,7 @@ func (e *relayEngine) retryFailed() {
 		if h.err == "" {
 			continue
 		}
-		e.closeHandleLocked(h)
+		e.closeHandleLocked(h, false)
 		e.ports[port] = e.openLocked(h.spec)
 	}
 }
@@ -163,7 +239,7 @@ func (e *relayEngine) apply(specs []relaySpec) {
 		if _, ok := want[port]; ok {
 			continue
 		}
-		e.closeHandleLocked(h)
+		e.closeHandleLocked(h, false)
 		delete(e.ports, port)
 	}
 	for port, sp := range want {
@@ -172,7 +248,8 @@ func (e *relayEngine) apply(specs []relaySpec) {
 			continue // 无变化：监听器与已建立的连接都保持
 		}
 		if ok {
-			e.closeHandleLocked(h)
+			// 同端口仅目标变化：保留已建立的 TCP 会话，只换监听与 UDP 会话。
+			e.closeHandleLocked(h, true)
 		}
 		e.ports[port] = e.openLocked(sp)
 	}
@@ -205,13 +282,53 @@ func (e *relayEngine) openLocked(sp relaySpec) *relayHandle {
 	return h
 }
 
-func (e *relayEngine) closeHandleLocked(h *relayHandle) {
+// closeHandleLocked 关闭一个入口端口。keepSessions 表示同端口仅目标变化：
+// 保留已建立的 TCP 会话；端口撤销、重试失败和进程退出一律关闭会话。
+func (e *relayEngine) closeHandleLocked(h *relayHandle, keepSessions bool) {
 	if h.tcp != nil {
-		// 关监听器不动已建立的连接，客户端会话自然走到结束。
+		// 关监听器本身不动会话；是否断已有连接由 keepSessions 决定。
 		_ = h.tcp.Close()
+	}
+	if !keepSessions {
+		e.closeTCPSessionsLocked(h.spec.Port)
 	}
 	if h.udp != nil {
 		h.udp.close()
+	}
+}
+
+// registerTCPSession 登记一条 TCP 会话；拨号期间端口已被撤销时返回 nil。
+func (e *relayEngine) registerTCPSession(port int, client, up net.Conn) *relayTCPSession {
+	s := &relayTCPSession{port: port, client: client, upstream: up}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.ports[port]; !ok {
+		return nil
+	}
+	if e.tcpSessions[port] == nil {
+		e.tcpSessions[port] = map[*relayTCPSession]struct{}{}
+	}
+	e.tcpSessions[port][s] = struct{}{}
+	return s
+}
+
+func (e *relayEngine) unregisterTCPSession(s *relayTCPSession) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if sessions, ok := e.tcpSessions[s.port]; ok {
+		delete(sessions, s)
+		if len(sessions) == 0 {
+			delete(e.tcpSessions, s.port)
+		}
+	}
+}
+
+// closeTCPSessionsLocked 关闭某入口端口上登记的全部 TCP 会话，覆盖新旧两代 handle。
+func (e *relayEngine) closeTCPSessionsLocked(port int) {
+	sessions := e.tcpSessions[port]
+	delete(e.tcpSessions, port)
+	for s := range sessions {
+		s.closeConns()
 	}
 }
 
@@ -221,25 +338,32 @@ func (e *relayEngine) serveTCP(ln net.Listener, sp relaySpec) {
 		if err != nil {
 			return
 		}
-		go relayPipeTCP(conn, sp)
+		go e.relayPipeTCP(conn, sp)
 	}
 }
 
-// relayPipeTCP 原样转发一条 TCP 连接，双向拷贝到落地入站端口。
-func relayPipeTCP(client net.Conn, sp relaySpec) {
+// relayPipeTCP 原样转发一条 TCP 连接，双向拷贝到落地入站端口；按成功写入计实际字节。
+func (e *relayEngine) relayPipeTCP(client net.Conn, sp relaySpec) {
 	defer client.Close()
 	up, err := net.DialTimeout("tcp", sp.target(), relayDialTimeout)
 	if err != nil {
 		return
 	}
 	defer up.Close()
+	session := e.registerTCPSession(sp.Port, client, up)
+	if session == nil {
+		return
+	}
+	defer e.unregisterTCPSession(session)
+	defer session.closeConns()
+	defer relayWakeStats()
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(up, client)
+		_, _ = io.Copy(relayCountingWriter{dst: up, upload: true}, client)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, up)
+		_, _ = io.Copy(relayCountingWriter{dst: client, upload: false}, up)
 		done <- struct{}{}
 	}()
 	<-done
@@ -275,7 +399,11 @@ func (e *relayEngine) serveUDP(t *relayUDP, sp relaySpec) {
 			go t.pumpBack(s, addr)
 		}
 		s.last.Store(time.Now().UnixNano())
-		if _, err := s.up.Write(buf[:n]); err != nil {
+		written, werr := s.up.Write(buf[:n])
+		if written > 0 {
+			relayNote(int64(written), true)
+		}
+		if werr != nil {
 			t.drop(key, s)
 		}
 	}
@@ -315,6 +443,7 @@ func (t *relayUDP) evictOldestLocked() {
 	if s, ok := t.sessions[oldestKey]; ok {
 		delete(t.sessions, oldestKey)
 		s.closeConn()
+		relayWakeStats()
 	}
 }
 
@@ -323,7 +452,11 @@ func (t *relayUDP) pumpBack(s *relayUDPSession, addr net.Addr) {
 	for {
 		n, err := s.up.Read(buf)
 		if n > 0 {
-			if _, werr := t.pc.WriteTo(buf[:n], addr); werr != nil {
+			written, werr := t.pc.WriteTo(buf[:n], addr)
+			if written > 0 {
+				relayNote(int64(written), false)
+			}
+			if werr != nil {
 				break
 			}
 			s.last.Store(time.Now().UnixNano())
@@ -342,6 +475,7 @@ func (t *relayUDP) drop(key string, s *relayUDPSession) {
 	}
 	t.mu.Unlock()
 	s.closeConn()
+	relayWakeStats()
 }
 
 // sweep 周期性拆除空闲会话。
@@ -360,11 +494,16 @@ func (t *relayUDP) prune(now int64) {
 	if t.closed {
 		return
 	}
+	removed := false
 	for key, s := range t.sessions {
 		if now-s.last.Load() >= int64(relayUDPIdle) {
 			delete(t.sessions, key)
 			s.closeConn()
+			removed = true
 		}
+	}
+	if removed {
+		relayWakeStats()
 	}
 }
 
@@ -385,6 +524,9 @@ func (t *relayUDP) close() {
 	for _, s := range sessions {
 		s.closeConn()
 	}
+	if len(sessions) > 0 {
+		relayWakeStats()
+	}
 }
 
 func (e *relayEngine) persistLocked(want map[int]relaySpec) {
@@ -401,7 +543,7 @@ func (e *relayEngine) persistLocked(want map[int]relaySpec) {
 		return
 	}
 	if err := writeRelayWant(e.dir, raw); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		logf(levelWarning, "%s", err.Error())
 		return
 	}
 	e.persist = next
@@ -467,12 +609,15 @@ func relayTruncate(msg string) string {
 	return cut
 }
 
-// relayStop 关闭全部入口监听器（进程退出路径）；已建立的连接随之自然结束。
+// relayStop 关闭全部入口监听器与会话（进程退出路径）。
 func relayStop() {
 	relayEng.mu.Lock()
 	defer relayEng.mu.Unlock()
 	for port, h := range relayEng.ports {
-		relayEng.closeHandleLocked(h)
+		relayEng.closeHandleLocked(h, false)
 		delete(relayEng.ports, port)
+	}
+	for port := range relayEng.tcpSessions {
+		relayEng.closeTCPSessionsLocked(port)
 	}
 }

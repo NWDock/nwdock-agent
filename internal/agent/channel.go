@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +46,11 @@ const (
 	msgDesiredReq = "desired_req"
 	msgDesired    = "desired"
 	msgQuota      = "quota"
+	// req/resp 对：面板主动拉起信息（重启结果、日志），带 id 应答；与 panel 侧常量逐字一致。
+	msgRestart       = "restart"
+	msgRestartResult = "restart_result"
+	msgLogReq        = "log_req"
+	msgLogResp       = "log_resp"
 )
 
 // message 是握手后每个 binary 帧的明文：紧凑 JSON {"t":"<type>","d":<任意 JSON>}。
@@ -187,15 +191,21 @@ func (s *session) requestDesired(ctx context.Context) error {
 
 func (s *session) sendHeartbeat(ctx context.Context) error {
 	core, coreVersion := runningCoreInfo()
+	startedAt := runningCoreStartedAt()
+	startedAtText := ""
+	if !startedAt.IsZero() {
+		startedAtText = startedAt.UTC().Format(time.RFC3339)
+	}
 	body, err := json.Marshal(map[string]any{
-		"runtime":      s.cfg.Runtime,
-		"version":      Version,
-		"core":         string(core),
-		"core_version": coreVersion,
-		"generation":   appliedGeneration(s.cfg.DataDir),
-		"error":        errorSummary(),
-		"image":        s.cfg.Image,
-		"relay":        relayStates(),
+		"runtime":         s.cfg.Runtime,
+		"version":         Version,
+		"core":            string(core),
+		"core_version":    coreVersion,
+		"core_started_at": startedAtText,
+		"generation":      appliedGeneration(s.cfg.DataDir),
+		"error":           errorSummary(),
+		"image":           s.cfg.Image,
+		"relay":           relayStates(),
 	})
 	if err != nil {
 		return err
@@ -228,7 +238,7 @@ func (s *session) serve(ctx context.Context) error {
 
 	// 先把上一轮还没入账的用量送出，面板再开新的预支轮次。
 	if err := reportStats(ctx, s); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		logf(levelWarning, "%s", err.Error())
 	}
 	if err := s.requestDesired(ctx); err != nil {
 		return err
@@ -262,7 +272,7 @@ func (s *session) serve(ctx context.Context) error {
 		case <-traffic.wake:
 			lastStats = time.Now()
 			if err := reportStats(ctx, s); err != nil {
-				fmt.Fprintln(os.Stderr, err.Error())
+				logf(levelWarning, "%s", err.Error())
 			}
 		case <-heartbeat.C:
 			if err := s.sendHeartbeat(ctx); err != nil {
@@ -276,10 +286,10 @@ func (s *session) serve(ctx context.Context) error {
 			if err := s.ping(ctx); err != nil {
 				return err
 			}
-			if core, _ := runningCoreInfo(); core != "" && time.Since(lastStats) >= statsInterval {
+			if time.Since(lastStats) >= statsInterval {
 				lastStats = time.Now()
 				if err := reportStats(ctx, s); err != nil {
-					fmt.Fprintln(os.Stderr, err.Error())
+					logf(levelWarning, "%s", err.Error())
 				}
 			}
 		case frame := <-inbox:
@@ -289,18 +299,23 @@ func (s *session) serve(ctx context.Context) error {
 			switch frame.msg.T {
 			case msgQuota:
 				if err := traffic.ApplySnapshot(frame.msg.D); err != nil {
-					fmt.Fprintln(os.Stderr, err.Error())
+					logf(levelWarning, "%s", err.Error())
 				}
 			case msgDesired:
 				gotDesired = true
 				if err := s.applyDesired(ctx, frame.msg.D); err != nil {
 					setError(err)
-					fmt.Fprintln(os.Stderr, err.Error())
+					logf(levelError, "%s", err.Error())
 					retryDesired = true
 					continue
 				}
 				setError(nil)
 				retryDesired = false
+			case msgRestart:
+				// 重启耗时（配置预检、启停、回滚），不阻塞消息循环。
+				go s.handleRestart(ctx, frame.msg.D)
+			case msgLogReq:
+				s.handleLogReq(ctx, frame.msg.D)
 			}
 		}
 	}

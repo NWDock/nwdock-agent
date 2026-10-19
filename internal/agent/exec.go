@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -51,11 +53,21 @@ func (e *execRuntime) Start(ctx context.Context, configPath, dir string) error {
 	cmd := exec.Command(e.bin, coreRunArgs(e.kind, configPath, dir)...)
 	cmd.Dir = dir
 	cmd.Env = coreEnv(e.kind, dir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	// 核心输出逐行 tee：原样写回进程输出（journald/docker 路径不变），同时入日志环供面板查看。
+	// 管道在核心退出时 EOF，两个 goroutine 自然收场。
+	go teeCoreOutput(e.kind, "stdout", os.Stdout, stdout)
+	go teeCoreOutput(e.kind, "stderr", os.Stderr, stderr)
 	e.mu.Lock()
 	e.cmd = cmd
 	e.mu.Unlock()
@@ -90,6 +102,7 @@ func (e *execRuntime) Start(ctx context.Context, configPath, dir string) error {
 		if proc.rt == e {
 			proc.core = ""
 			proc.version = ""
+			proc.startedAt = time.Time{}
 		}
 		proc.mu.Unlock()
 	}()
@@ -103,6 +116,18 @@ func (e *execRuntime) Stop() {
 	e.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
+	}
+}
+
+// teeCoreOutput 逐行接管核心 stdout/stderr：透传回进程标准输出（service/docker 日志路径不变），
+// 并按行内级别标记入日志环。核心被杀时管道 EOF，函数返回。
+func teeCoreOutput(kind coreKind, stream string, dst io.Writer, src io.Reader) {
+	sc := bufio.NewScanner(src)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		fmt.Fprintln(dst, line)
+		logs.append(time.Now(), string(kind), coreLogLevel(line), line)
 	}
 }
 

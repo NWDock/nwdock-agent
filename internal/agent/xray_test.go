@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSkeletonIgnoresBusinessInbounds(t *testing.T) {
@@ -99,5 +101,62 @@ func TestAbsolutizeMihomo(t *testing.T) {
 	}
 	if doc.Proxies[0].Type != "wireguard" || doc.Proxies[0].PrivateKey != wgKey {
 		t.Fatalf("wireguard key changed: %s", doc.Proxies[0].PrivateKey)
+	}
+}
+
+type fakeCoreRuntime struct{ running bool }
+
+func (f *fakeCoreRuntime) Kind() coreKind { return coreXray }
+func (f *fakeCoreRuntime) Test(context.Context, string, string) error {
+	return nil
+}
+func (f *fakeCoreRuntime) Start(context.Context, string, string) error {
+	f.running = true
+	return nil
+}
+func (f *fakeCoreRuntime) Apply(context.Context, string, string, map[string][]byte, string, []sharedDesired, bool, bool) error {
+	return nil
+}
+func (f *fakeCoreRuntime) Stop()           { f.running = false }
+func (f *fakeCoreRuntime) Running() bool   { return f.running }
+func (f *fakeCoreRuntime) Version() string { return "test" }
+func (f *fakeCoreRuntime) Counters(context.Context) (map[string]int64, error) {
+	return nil, nil
+}
+
+// 核心启动时刻的记录与清理：startLocked 成功后有值（心跳据此发 core_started_at），
+// stopLocked 与意外退出善后（exec.go 清 core/version）后必须回到零值。
+func TestCoreStartedAtLifecycle(t *testing.T) {
+	resetProc := func(rt coreRuntime, startedAt time.Time) {
+		proc.mu.Lock()
+		proc.rt, proc.core, proc.version, proc.startedAt = rt, "", "", time.Time{}
+		if rt != nil {
+			proc.core, proc.version = coreXray, rt.Version()
+		}
+		proc.startedAt = startedAt
+		proc.mu.Unlock()
+	}
+	resetProc(nil, time.Time{})
+	defer resetProc(nil, time.Time{})
+
+	if got := runningCoreStartedAt(); !got.IsZero() {
+		t.Fatalf("not running must be zero, got %v", got)
+	}
+
+	booted := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	resetProc(&fakeCoreRuntime{running: true}, booted)
+	got := runningCoreStartedAt()
+	if got.IsZero() || !got.Equal(booted) {
+		t.Fatalf("running: want %v got %v", booted, got)
+	}
+
+	stopLocked()
+	if !runningCoreStartedAt().IsZero() {
+		t.Fatal("stopLocked must clear startedAt")
+	}
+
+	resetProc(&fakeCoreRuntime{running: false}, booted)
+	if got := runningCoreStartedAt(); !got.IsZero() {
+		t.Fatalf("crashed core must be zero, got %v", got)
 	}
 }

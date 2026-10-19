@@ -24,15 +24,75 @@ type coreProc struct {
 	rt           coreRuntime
 	core         coreKind
 	version      string
+	startedAt    time.Time
 	generation   int
 	loaded       bool
 	applied      map[string][]byte
 	skeleton     string
 	appliedUsers map[string]map[string]string
 	usersLoaded  bool
+	// lastDesired 是最近一次收到的 desired 原文，供面板重启命令重拉核心；
+	// 含口令，只留内存不落盘（agent 重启后经 desired_req 很快重新拿到）。
+	lastDesired json.RawMessage
 }
 
 var proc coreProc
+
+// desiredBody 是面板 desired 消息的载荷；字段名与 panel 侧 desiredPayload 逐字一致。
+type desiredBody struct {
+	Generation int              `json:"generation"`
+	Serving    bool             `json:"serving"`
+	Core       string           `json:"core"`
+	Config     json.RawMessage  `json:"config"`
+	Files      []desiredFile    `json:"files"`
+	Shared     []sharedDesired  `json:"shared"`
+	Geo        []geoDesired     `json:"geo"`
+	RuleSets   []ruleSetDesired `json:"rule_sets"`
+	Quota      json.RawMessage  `json:"quota"`
+	Relays     []relaySpec      `json:"relays"`
+	LogLevel   string           `json:"log_level"`
+}
+
+// bootArgs 是 bootWithRollback/restartLocked 需要的一组派生参数。
+type bootArgs struct {
+	bin     string
+	kind    coreKind
+	current string
+	raws    map[string][]byte
+	skel    string
+	shared  []sharedDesired
+}
+
+// deriveBootArgs 从 desired 载荷与当前已落地的配置文件派生启动参数；
+// applyDesired 的重启分支与面板重启命令共用，避免两处复制派生逻辑。
+func deriveBootArgs(cfg Config, body *desiredBody) (bootArgs, error) {
+	want := normalizeCore(body.Core)
+	var bin string
+	if want != coreMihomo {
+		bin = coreBin(want)
+		if bin == "" {
+			return bootArgs{}, fmt.Errorf("%s is required", coreBinEnv(want))
+		}
+	}
+	current := filepath.Join(cfg.DataDir, coreConfigName(want))
+	rendered, err := os.ReadFile(current)
+	if err != nil {
+		return bootArgs{}, err
+	}
+	var raws map[string][]byte
+	var skel string
+	if want == coreXray {
+		raws, err = inboundRaws(rendered)
+		if err != nil {
+			return bootArgs{}, err
+		}
+		skel, err = skeleton(rendered)
+		if err != nil {
+			return bootArgs{}, err
+		}
+	}
+	return bootArgs{bin: bin, kind: want, current: current, raws: raws, skel: skel, shared: body.Shared}, nil
+}
 
 type desiredFile struct {
 	Path string `json:"path"`
@@ -120,7 +180,7 @@ func syncAssets(ctx context.Context, cfg Config, entries []geoDesired) (bool, er
 			return changed, err
 		}
 		changed = true
-		fmt.Println("geo", entry.Name)
+		logf(levelDebug, "geo %s", entry.Name)
 	}
 	if dropCaseTwins(cfg.DataDir, entries) {
 		changed = true
@@ -145,10 +205,10 @@ func dropCaseTwins(dir string, entries []geoDesired) bool {
 				continue
 			}
 			if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
-				fmt.Fprintf(os.Stderr, "geo twin %s: %v\n", fi.Name(), err)
+				logf(levelWarning, "geo twin %s: %v", fi.Name(), err)
 				continue
 			}
-			fmt.Println("geo twin", fi.Name())
+			logf(levelInfo, "geo twin %s", fi.Name())
 			removed = true
 		}
 	}
@@ -194,20 +254,12 @@ func coreEnv(kind coreKind, dir string) []string {
 // applyDesired 应用面板经加密通道推送的 desired 载荷（现 desired 端点响应原样）。
 func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	api := coreAPIAddr()
-	var body struct {
-		Generation int              `json:"generation"`
-		Serving    bool             `json:"serving"`
-		Core       string           `json:"core"`
-		Config     json.RawMessage  `json:"config"`
-		Files      []desiredFile    `json:"files"`
-		Shared     []sharedDesired  `json:"shared"`
-		Geo        []geoDesired     `json:"geo"`
-		RuleSets   []ruleSetDesired `json:"rule_sets"`
-		Quota      json.RawMessage  `json:"quota"`
-		Relays     []relaySpec      `json:"relays"`
-	}
+	var body desiredBody
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return err
+	}
+	if body.LogLevel != "" {
+		setLogLevel(body.LogLevel)
 	}
 	// 入口转发与核心完全解耦：清单无条件下发，无论 serving 与核心状态如何都先应用；
 	// 之后核心重启、换核或配置失败都不影响已建立的入口转发。
@@ -220,6 +272,7 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	want := normalizeCore(body.Core)
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
+	proc.lastDesired = raw
 	if !proc.loaded {
 		raw, err := os.ReadFile(filepath.Join(s.cfg.DataDir, "applied-generation"))
 		if err == nil {
@@ -235,6 +288,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		return nil
 	}
 	if !body.Serving {
+		// 停核心前补一次用量：relay 已先按新清单撤销，转发尾量不会拖到下一账期。
+		_ = reportStatsLocked(ctx, s)
 		stopLocked()
 		proc.applied = nil
 		proc.skeleton = ""
@@ -262,20 +317,20 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	switching := runningLocked() && proc.core != want
 	if switching {
 		if err := reportStatsLocked(ctx, s); err != nil {
-			fmt.Fprintln(os.Stderr, err.Error())
+			logf(levelWarning, "%s", err.Error())
 		}
 	}
 	filled, err := materializeWGCF(ctx, s.cfg.DataDir, want, body.Config)
 	if err != nil {
 		if switching {
-			fmt.Fprintf(os.Stderr, "degraded: keeping %s: %s\n", proc.core, err.Error())
+			logf(levelError, "degraded: keeping %s: %s", proc.core, err.Error())
 		}
 		return err
 	}
 	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, filled, body.Files)
 	if err != nil {
 		if switching {
-			fmt.Fprintf(os.Stderr, "degraded: keeping %s: %s\n", proc.core, err.Error())
+			logf(levelError, "degraded: keeping %s: %s", proc.core, err.Error())
 		}
 		return err
 	}
@@ -298,7 +353,7 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
 		}
-		fmt.Println("switch", want)
+		logf(levelInfo, "switch %s", want)
 	case !runningLocked():
 		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
@@ -323,12 +378,12 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 				if !errors.Is(err, errNeedRestart) && want != coreMihomo {
 					return err
 				}
-				fmt.Fprintln(os.Stderr, err.Error())
+				logf(levelWarning, "%s", err.Error())
 				if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 					return err
 				}
 			} else if plan == planReload {
-				fmt.Println("reload")
+				logf(levelInfo, "reload")
 			}
 		}
 	}
@@ -408,7 +463,7 @@ func bootWithRollback(ctx context.Context, cfg Config, api, bin string, kind cor
 	if rerr != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "degraded: %s start failed (%v), rolling back to previous config\n", kind, err)
+	logf(levelError, "degraded: %s start failed (%v), rolling back to previous config", kind, err)
 	if werr := os.WriteFile(current, prevData, 0o600); werr != nil {
 		return fmt.Errorf("%v; restore previous config: %w", err, werr)
 	}
@@ -427,14 +482,91 @@ func bootWithRollback(ctx context.Context, cfg Config, api, bin string, kind cor
 
 func restartLocked(ctx context.Context, s *session, cfg Config, api, bin string, kind coreKind, current string, raws map[string][]byte, skel string, shared []sharedDesired) error {
 	if err := reportStatsLocked(ctx, s); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		logf(levelWarning, "%s", err.Error())
 	}
 	stopLocked()
 	if err := bootWithRollback(ctx, cfg, api, bin, kind, current, raws, skel, shared); err != nil {
 		return err
 	}
-	fmt.Println("restart")
+	logf(levelInfo, "restart")
 	return nil
+}
+
+// restartCore 处理面板重启命令：以当前已落地配置整进程重启（stop + bootWithRollback，失败回滚）。
+// 核心未运行（含整机停服）时回失败，不把停着的核心拉起来。
+func restartCore(ctx context.Context, s *session) error {
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	if !runningLocked() {
+		return errors.New("核心未在运行")
+	}
+	if len(proc.lastDesired) == 0 {
+		return errors.New("暂无可重启的配置（agent 启动后尚未收到配置）")
+	}
+	var body desiredBody
+	if err := json.Unmarshal(proc.lastDesired, &body); err != nil {
+		return err
+	}
+	args, err := deriveBootArgs(s.cfg, &body)
+	if err != nil {
+		return err
+	}
+	if args.kind != proc.core {
+		return fmt.Errorf("期望核心 %s 与运行核心 %s 不一致", args.kind, proc.core)
+	}
+	return restartLocked(ctx, s, s.cfg, coreAPIAddr(), args.bin, args.kind, args.current, args.raws, args.skel, args.shared)
+}
+
+// handleRestart 处理 panel→agent 的 restart 命令，完成后回 restart_result。
+// 在 goroutine 里跑：重启耗时不阻塞消息循环，与 applyDesired 经 proc.mu 串行。
+func (s *session) handleRestart(ctx context.Context, raw json.RawMessage) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
+		return
+	}
+	res := map[string]any{"id": req.ID, "ok": true}
+	if err := restartCore(ctx, s); err != nil {
+		res["ok"] = false
+		res["error"] = err.Error()
+	}
+	rawRes, err := json.Marshal(res)
+	if err != nil {
+		return
+	}
+	if err := s.send(ctx, message{T: msgRestartResult, D: rawRes}); err != nil {
+		logf(levelWarning, "%s", err.Error())
+	}
+}
+
+// handleLogReq 处理 panel→agent 的 log_req：回环形缓冲尾部若干行。
+func (s *session) handleLogReq(ctx context.Context, raw json.RawMessage) {
+	var req struct {
+		ID   string `json:"id"`
+		Tail int    `json:"tail"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
+		return
+	}
+	tail := req.Tail
+	if tail <= 0 {
+		tail = 200
+	}
+	if tail > logRingMaxLines {
+		tail = logRingMaxLines
+	}
+	lines, truncated := logs.snapshot(tail)
+	if lines == nil {
+		lines = []logLine{}
+	}
+	rawRes, err := json.Marshal(map[string]any{"id": req.ID, "lines": lines, "truncated": truncated})
+	if err != nil {
+		return
+	}
+	if err := s.send(ctx, message{T: msgLogResp, D: rawRes}); err != nil {
+		logf(levelWarning, "%s", err.Error())
+	}
 }
 
 func testCoreConfig(ctx context.Context, kind coreKind, bin, config, dir string) error {
@@ -463,6 +595,7 @@ func startLocked(ctx context.Context, kind coreKind, bin, config, dir string) er
 	proc.rt = rt
 	proc.core = kind
 	proc.version = rt.Version()
+	proc.startedAt = time.Now()
 	return nil
 }
 
@@ -479,6 +612,17 @@ func runningCoreInfo() (coreKind, string) {
 	return proc.core, proc.version
 }
 
+// runningCoreStartedAt 返回正在运行的核心的启动时刻；未运行时零值。
+// 口径同 runningCoreInfo：按 rt.Running() 判定，心跳据此上报运行时长。
+func runningCoreStartedAt() time.Time {
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	if proc.rt == nil || !proc.rt.Running() {
+		return time.Time{}
+	}
+	return proc.startedAt
+}
+
 func stopLocked() {
 	if proc.rt != nil {
 		proc.rt.Stop()
@@ -486,6 +630,7 @@ func stopLocked() {
 	}
 	proc.core = ""
 	proc.version = ""
+	proc.startedAt = time.Time{}
 }
 
 func diffLocked(ctx context.Context, bin, api, dir string, want map[string][]byte, reload bool) (map[string]bool, error) {
@@ -507,7 +652,7 @@ func diffLocked(ctx context.Context, bin, api, dir string, want map[string][]byt
 				return nil, cmdFail("remove "+tag, out, err)
 			}
 			reapplied[tag] = true
-			fmt.Println("rmi", tag)
+			logf(levelInfo, "rmi %s", tag)
 		}
 	}
 	for tag, raw := range want {
@@ -521,7 +666,7 @@ func diffLocked(ctx context.Context, bin, api, dir string, want map[string][]byt
 			if out, err := exec.CommandContext(ctx, bin, "api", "rmi", "--server", api, tag).CombinedOutput(); err != nil {
 				return nil, cmdFail("remove "+tag, out, err)
 			}
-			fmt.Println("rmi", tag)
+			logf(levelInfo, "rmi %s", tag)
 		}
 		file := filepath.Join(dir, "inbound-"+tag+".json")
 		wrapped, err := json.Marshal(map[string]any{"inbounds": []json.RawMessage{raw}})
@@ -539,7 +684,7 @@ func diffLocked(ctx context.Context, bin, api, dir string, want map[string][]byt
 			return nil, cmdFail("add "+tag, out, err)
 		}
 		reapplied[tag] = true
-		fmt.Println("adi", tag)
+		logf(levelInfo, "adi %s", tag)
 	}
 	return reapplied, nil
 }

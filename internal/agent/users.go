@@ -161,7 +161,7 @@ func reconcileUsers(ctx context.Context, bin, api, dir string, shared []sharedDe
 		have := proc.appliedUsers[tag]
 		if item.Protocol == "shadowsocks" && isSS2022(item.Method) && have == nil && !hasUser(item.Users, "bootstrap") {
 			if err := removeUsers(ctx, bin, api, tag, []string{"bootstrap"}); err != nil {
-				fmt.Println("rmu bootstrap", tag, err)
+				logf(levelWarning, "rmu bootstrap %s: %s", tag, err.Error())
 			}
 		}
 		drop, add := diffUsers(have, item)
@@ -231,7 +231,7 @@ func removeUsers(ctx context.Context, bin, api, tag string, emails []string) err
 	if n, ok := reportedCount(out); !ok || n != len(emails) {
 		return fmt.Errorf("rmu %s: %s", tag, safeOut(out))
 	}
-	fmt.Println("rmu", tag, len(emails))
+	logf(levelInfo, "rmu %s %d", tag, len(emails))
 	return nil
 }
 
@@ -257,6 +257,6 @@ func addUsers(ctx context.Context, bin, api, dir string, item sharedDesired, tag
 	if n, ok := reportedCount(out); !ok || n != len(users) {
 		return fmt.Errorf("adu %s: %s", tag, safeOut(out))
 	}
-	fmt.Println("adu", tag, len(users))
+	logf(levelInfo, "adu %s %d", tag, len(users))
 	return nil
 }

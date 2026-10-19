@@ -82,10 +82,28 @@ func reportCounters(ctx context.Context, s *session, core coreKind) error {
 		}
 		counters, err = collectStats(ctx, bin, coreAPIAddr())
 	default:
-		return submitStats(ctx, s, nil, true)
+		counters = relayCounters()
+		return submitStats(ctx, s, counters, true)
 	}
 	if err != nil {
 		return err
 	}
-	return submitStats(ctx, s, counters, core == coreMihomo)
+	return submitStats(ctx, s, mergeRelayCounters(counters), core == coreMihomo)
+}
+
+// mergeRelayCounters 把入口转发累计并进核心 counters；转发与核心命名空间不重叠。
+func mergeRelayCounters(counters map[string]int64) map[string]int64 {
+	relay := relayCounters()
+	if len(relay) == 0 {
+		return counters
+	}
+	if counters == nil {
+		counters = make(map[string]int64, len(relay))
+	}
+	for name, value := range relay {
+		if _, ok := counters[name]; !ok {
+			counters[name] = value
+		}
+	}
+	return counters
 }

@@ -179,10 +179,10 @@ func Run(ctx context.Context, cfg Config) error {
 	tokenRetried := false
 	if cfg.fromFile {
 		if cfg.noteMihomo {
-			fmt.Fprintln(os.Stderr, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
+			logf(levelWarning, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
 		}
 	} else if bin, _ := envfile.First("AGENT_MIHOMO_BIN", "MIHOMO_BIN"); bin != "" {
-		fmt.Fprintln(os.Stderr, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
+		logf(levelWarning, "AGENT_MIHOMO_BIN 已忽略：mihomo 由 agent 内置")
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -195,7 +195,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		fmt.Fprintln(os.Stderr, err.Error())
+		logf(levelWarning, "%s", err.Error())
 		// 面板以 4401 unknown agent 提示指纹未绑定：带安装令牌重试一次（防抖），之后照常退避。
 		if !tokenRetried && cfg.Token != "" && unknownAgentClose(err) {
 			tokenRetried = true

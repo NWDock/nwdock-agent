@@ -299,15 +299,48 @@ func TestMeterLooseOpensAfterDisconnect(t *testing.T) {
 	}
 }
 
-func TestMeterGrantedDoesNotShrink(t *testing.T) {
+func TestMeterGrantedShrinksUnusedNotUsed(t *testing.T) {
 	now := time.Unix(5_000, 0)
 	m := testMeter(&now)
 	acc := mustGrant(t, m, grantJSON("s1", 500, 100, "inbound>>>nw", "strict"))
 	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))); err != nil {
 		t.Fatal(err)
 	}
-	if acc.granted.Load() != 500 {
-		t.Fatalf("granted shrank to %d", acc.granted.Load())
+	if acc.granted.Load() != 100 {
+		t.Fatalf("unused grant stayed %d", acc.granted.Load())
+	}
+	acc.used.Store(80)
+	if err := m.ApplySnapshot([]byte(grantJSON("s1", 50, 100, "inbound>>>nw", "strict"))); err != nil {
+		t.Fatal(err)
+	}
+	if acc.granted.Load() != 80 {
+		t.Fatalf("granted fell below used: %d", acc.granted.Load())
+	}
+}
+
+func TestMeterStarterSignalsAndCaps(t *testing.T) {
+	now := time.Unix(7_000, 0)
+	m := testMeter(&now)
+	raw := `{"epoch":"e1","mode":"strict","ttl_s":600,"low_water":50,"starter_bytes":100,"leases":[{"sub":"s1","starter":true,"keys":{"inbound>>>nw":100}}]}`
+	acc := mustGrant(t, m, raw)
+	if acc.granted.Load() != 100 || !acc.starter {
+		t.Fatalf("courtesy granted %d starter %v", acc.granted.Load(), acc.starter)
+	}
+	peer, local := net.Pipe()
+	defer peer.Close()
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
+	conn := &meterConn{m: m, Conn: local, acc: acc, rate: 100, ctr: m.counterLocked("inbound>>>nw")}
+	if _, err := conn.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-m.wake:
+	default:
+		t.Fatal("first byte must wake")
+	}
+	n, err := conn.Write(make([]byte, 200))
+	if n != 99 || err == nil {
+		t.Fatalf("cap n %d err %v", n, err)
 	}
 }
 

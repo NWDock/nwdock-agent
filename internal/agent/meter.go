@@ -18,18 +18,20 @@ const (
 	quotaReportMin  = 500 * time.Millisecond
 )
 
-// quotaSnapshot 是面板下发的本机额度。granted 在同一 epoch 内只增不减。
+// quotaSnapshot 是面板下发的本机额度。未使用部分可以下调，已计费字节不会被抹掉。
 type quotaSnapshot struct {
-	Epoch    string       `json:"epoch"`
-	Mode     string       `json:"mode"`
-	TTL      int          `json:"ttl_s"`
-	LowWater int          `json:"low_water"`
-	Leases   []quotaLease `json:"leases"`
+	Epoch        string       `json:"epoch"`
+	Mode         string       `json:"mode"`
+	TTL          int          `json:"ttl_s"`
+	LowWater     int          `json:"low_water"`
+	StarterBytes int64        `json:"starter_bytes"`
+	Leases       []quotaLease `json:"leases"`
 }
 
 type quotaLease struct {
 	Sub       string         `json:"sub"`
 	Unlimited bool           `json:"unlimited"`
+	Starter   bool           `json:"starter"`
 	Granted   int64          `json:"granted"`
 	Keys      map[string]int `json:"keys"`
 }
@@ -47,6 +49,7 @@ type trafficMeter struct {
 	epoch          string
 	mode           string
 	lowWater       int
+	starterBytes   int64
 	expires        time.Time
 	connected      bool
 	disconnectedAt time.Time
@@ -71,6 +74,7 @@ type meterAccount struct {
 	used      atomic.Int64
 	lastTopUp atomic.Int64
 	unlimited bool
+	starter   bool
 	conns     map[ioCloser]struct{}
 }
 
@@ -85,14 +89,15 @@ type ioCloser interface {
 
 func newTrafficMeter() *trafficMeter {
 	return &trafficMeter{
-		mode:     "strict",
-		lowWater: 50,
-		accounts: map[string]*meterAccount{},
-		keys:     map[string]meterKey{},
-		raw:      map[string]*rawCounter{},
-		live:     map[ioCloser]string{},
-		wake:     make(chan struct{}, 1),
-		now:      time.Now,
+		mode:         "strict",
+		lowWater:     50,
+		starterBytes: 1 << 20,
+		accounts:     map[string]*meterAccount{},
+		keys:         map[string]meterKey{},
+		raw:          map[string]*rawCounter{},
+		live:         map[ioCloser]string{},
+		wake:         make(chan struct{}, 1),
+		now:          time.Now,
 	}
 }
 
@@ -280,7 +285,8 @@ func (m *trafficMeter) setConnected(on bool) {
 	m.mu.Unlock()
 }
 
-// ApplySnapshot 应用面板的额度快照。同一 epoch 的 granted 只升不降；换 epoch 清零本轮用量。
+// ApplySnapshot 应用面板的额度快照。未使用的 granted 可以下调，但不能低于已经计费的字节。
+// 换 epoch 清零本轮用量。starter 在本地已用之上再给起步额度。
 func (m *trafficMeter) ApplySnapshot(raw []byte) error {
 	var snap quotaSnapshot
 	if err := json.Unmarshal(raw, &snap); err != nil {
@@ -302,6 +308,11 @@ func (m *trafficMeter) ApplySnapshot(raw []byte) error {
 	m.epoch = snap.Epoch
 	m.mode = snap.Mode
 	m.lowWater = snap.LowWater
+	if snap.StarterBytes > 0 {
+		m.starterBytes = snap.StarterBytes
+	} else if m.starterBytes <= 0 {
+		m.starterBytes = 1 << 20
+	}
 	m.expires = now.Add(ttl - quotaClockSkew)
 	keep := map[string]bool{}
 	m.keys = map[string]meterKey{}
@@ -317,25 +328,38 @@ func (m *trafficMeter) ApplySnapshot(raw []byte) error {
 			m.accounts[lease.Sub] = acc
 		}
 		acc.unlimited = lease.Unlimited
+		acc.starter = lease.Starter && !lease.Unlimited
 		prev := acc.granted.Load()
+		used := acc.used.Load()
 		if fresh {
 			acc.used.Store(0)
+			used = 0
 			prev = 0
 		}
-		next := lease.Granted
-		if !fresh && next < prev && !lease.Unlimited {
-			next = prev
-		}
-		if lease.Unlimited {
+		var next int64
+		switch {
+		case lease.Unlimited:
 			next = 0
+		case acc.starter:
+			extra := m.starterBytes
+			if extra <= 0 {
+				extra = 1 << 20
+			}
+			next = used + extra
+			acc.lastTopUp.Store(extra)
+		default:
+			next = lease.Granted
+			if next < used {
+				next = used
+			}
+			switch {
+			case fresh:
+				acc.lastTopUp.Store(next)
+			case next > prev:
+				acc.lastTopUp.Store(next - prev)
+			}
 		}
 		acc.granted.Store(next)
-		switch {
-		case fresh:
-			acc.lastTopUp.Store(next)
-		case next > prev:
-			acc.lastTopUp.Store(next - prev)
-		}
 		for key, rate := range lease.Keys {
 			if rate <= 0 {
 				rate = 100
@@ -408,6 +432,9 @@ func (m *trafficMeter) signal() {
 func (m *trafficMeter) maybeSignal(acc *meterAccount) {
 	if acc == nil || acc.unlimited {
 		return
+	}
+	if acc.starter && acc.used.Load() > 0 {
+		m.signal()
 	}
 	remain := acc.granted.Load() - acc.used.Load()
 	top := acc.lastTopUp.Load()

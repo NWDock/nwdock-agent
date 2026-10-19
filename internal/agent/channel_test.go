@@ -916,7 +916,7 @@ func TestChannelMessageShapes(t *testing.T) {
 		if !ok {
 			t.Fatalf("frames %v", seen)
 		}
-		for _, key := range []string{"runtime", "version", "core", "core_version", "generation", "error", "image"} {
+		for _, key := range []string{"runtime", "version", "core", "core_version", "core_started_at", "generation", "error", "image"} {
 			if _, ok := beat[key]; !ok {
 				t.Fatalf("heartbeat missing %q: %v", key, beat)
 			}

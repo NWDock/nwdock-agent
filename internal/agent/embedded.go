@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/metacubex/mihomo/common/observable"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
+	mihomolog "github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
@@ -20,6 +23,7 @@ type embeddedRuntime struct {
 	version   string
 	running   bool
 	listeners map[string]C.InboundListener
+	logSub    observable.Subscription[mihomolog.Event]
 }
 
 func newEmbeddedRuntime() *embeddedRuntime {
@@ -47,11 +51,31 @@ func (e *embeddedRuntime) Test(_ context.Context, configPath, dir string) error 
 }
 
 func (e *embeddedRuntime) Start(ctx context.Context, configPath, dir string) error {
+	// mihomo 自身仍打印到 stdout；这里订阅 observable 只是把事件收入日志环供面板查看。
+	e.logSub = mihomolog.Subscribe()
+	go e.captureLogs(e.logSub)
 	if err := e.Apply(ctx, configPath, dir, nil, "", nil, true, false); err != nil {
 		e.Stop()
 		return err
 	}
 	return nil
+}
+
+// captureLogs 消费 mihomo 日志事件入环；UnSubscribe 关闭通道后函数退出。
+func (e *embeddedRuntime) captureLogs(sub observable.Subscription[mihomolog.Event]) {
+	for ev := range sub {
+		logs.append(time.Now(), string(coreMihomo), mihomologLevel(ev.LogLevel), ev.Payload)
+	}
+}
+
+// mihomologLevel 把 mihomo 的级别映射成与面板一致的词汇。
+func mihomologLevel(level mihomolog.LogLevel) string {
+	switch level.String() {
+	case "debug", "info", "warning", "error":
+		return level.String()
+	default:
+		return "info"
+	}
 }
 
 func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, _ []sharedDesired, geoChanged, _ bool) error {
@@ -102,6 +126,10 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 }
 
 func (e *embeddedRuntime) Stop() {
+	if e.logSub != nil {
+		mihomolog.UnSubscribe(e.logSub)
+		e.logSub = nil
+	}
 	for name, lis := range e.listeners {
 		traffic.closeInbound(name)
 		_ = lis.Close()

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -176,7 +175,7 @@ func probeVersion(ctx context.Context, bin string, kind coreKind) string {
 	defer cancel()
 	out, err := exec.CommandContext(probe, bin, coreVersionArgs(kind)...).Output()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s version probe: %s\n", kind, err.Error())
+		logf(levelWarning, "%s version probe: %s", kind, err.Error())
 		return ""
 	}
 	line, _, _ := strings.Cut(string(out), "\n")
