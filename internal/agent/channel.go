@@ -243,7 +243,9 @@ func (s *session) serve(ctx context.Context) error {
 	if err := s.requestDesired(ctx); err != nil {
 		return err
 	}
-	inbox := make(chan inboxFrame, 8)
+	// 缓冲要盖过一次 ping 等待（20s）里面板可能塞来的帧。日志泵 2s 一帧，
+	// 缓冲只有 8 时读协程会堵在入队、离开 Read，pong 和 close 都收不到。
+	inbox := make(chan inboxFrame, 32)
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
 	go func() {
@@ -265,10 +267,18 @@ func (s *session) serve(ctx context.Context) error {
 	var lastStats time.Time
 	gotDesired := false
 	retryDesired := false
+	// pingCh 为 nil 时 select 不会选中。ping 在旁路等 pong，主循环继续收帧，
+	// 否则等 pong 的 20s 内不消费 inbox，读协程离开 Read 后 pong 永远进不来。
+	var pingCh chan error
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-pingCh:
+			pingCh = nil
+			if err != nil {
+				return err
+			}
 		case <-traffic.wake:
 			lastStats = time.Now()
 			if err := reportStats(ctx, s); err != nil {
@@ -283,8 +293,11 @@ func (s *session) serve(ctx context.Context) error {
 					return err
 				}
 			}
-			if err := s.ping(ctx); err != nil {
-				return err
+			if pingCh == nil {
+				pingCh = make(chan error, 1)
+				go func(ch chan error) {
+					ch <- s.ping(ctx)
+				}(pingCh)
 			}
 			if time.Since(lastStats) >= statsInterval {
 				lastStats = time.Now()
