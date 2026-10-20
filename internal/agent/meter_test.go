@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"errors"
 	"io"
 	"net"
 	"testing"
@@ -16,118 +15,42 @@ func testMeter(clock *time.Time) *trafficMeter {
 	return m
 }
 
-func grantJSON(sub string, granted int64, rate int, key, mode string) string {
-	return `{"epoch":"e1","mode":"` + mode + `","ttl_s":600,"low_water":50,"leases":[{"sub":"` + sub + `","granted":` + itoa(granted) + `,"keys":{"` + key + `":` + itoa(int64(rate)) + `}}]}`
-}
-
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
-
-func mustGrant(t *testing.T, m *trafficMeter, raw string) *meterAccount {
-	t.Helper()
-	if err := m.ApplySnapshot([]byte(raw)); err != nil {
-		t.Fatal(err)
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, acc := range m.accounts {
-		return acc
-	}
-	t.Fatal("no account")
-	return nil
-}
-
-func TestMeterTCPTruncatesUplinkAndDownlink(t *testing.T) {
-	const grant = int64(4 << 20)
+func TestMeterTCPCountsUplinkAndDownlink(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", grant, 100, "inbound>>>nw", "strict"))
 	ctr := m.counterLocked("inbound>>>nw")
 
 	upClient, upServer := net.Pipe()
-	up := &meterConn{m: m, Conn: upServer, acc: acc, rate: 100, ctr: ctr}
+	up := &meterConn{m: m, Conn: upServer, ctr: ctr}
+	defer up.Close()
 	go func() {
-		buf := make([]byte, 32<<10)
-		left := int64(10 << 20)
-		for left > 0 {
-			n := int64(len(buf))
-			if n > left {
-				n = left
-			}
-			if _, err := upClient.Write(buf[:n]); err != nil {
-				return
-			}
-			left -= n
-		}
+		_, _ = upClient.Write([]byte("hello"))
+		_ = upClient.Close()
 	}()
-	got := int64(0)
-	buf := make([]byte, 64<<10)
-	for {
-		n, err := up.Read(buf)
-		got += int64(n)
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) && got != grant {
-				t.Fatal(err)
-			}
-			break
-		}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(up, buf); err != nil {
+		t.Fatal(err)
 	}
-	if got != grant || acc.used.Load() != grant {
-		t.Fatalf("uplink got %d used %d want %d", got, acc.used.Load(), grant)
-	}
-	if ctr.up.Load() != grant {
+	if ctr.up.Load() != 5 {
 		t.Fatalf("uplink counter %d", ctr.up.Load())
 	}
-	_ = upClient.Close()
 
-	acc.used.Store(0)
 	downPeer, downLocal := net.Pipe()
-	down := &meterConn{m: m, Conn: downLocal, acc: acc, rate: 100, ctr: ctr}
-	done := make(chan int64, 1)
+	down := &meterConn{m: m, Conn: downLocal, ctr: ctr}
+	defer down.Close()
+	sunk := make(chan int, 1)
 	go func() {
-		n, _ := io.Copy(io.Discard, downPeer)
-		done <- n
+		b := make([]byte, 7)
+		n, _ := io.ReadFull(downPeer, b)
+		sunk <- n
 	}()
-	payload := make([]byte, 64<<10)
-	left := int64(10 << 20)
-	written := int64(0)
-	for left > 0 {
-		n := int64(len(payload))
-		if n > left {
-			n = left
-		}
-		w, err := down.Write(payload[:n])
-		written += int64(w)
-		left -= n
-		if err != nil {
-			break
-		}
+	if n, err := down.Write([]byte("goodbye")); err != nil || n != 7 {
+		t.Fatalf("write n %d err %v", n, err)
 	}
-	_ = down.Close()
-	sunk := <-done
-	if written != grant || sunk != grant || acc.used.Load() != grant {
-		t.Fatalf("downlink written %d sunk %d used %d want %d", written, sunk, acc.used.Load(), grant)
+	if got := <-sunk; got != 7 {
+		t.Fatalf("peer read %d", got)
 	}
-	if ctr.down.Load() != grant {
+	if ctr.down.Load() != 7 {
 		t.Fatalf("downlink counter %d", ctr.down.Load())
 	}
 }
@@ -135,30 +58,23 @@ func TestMeterTCPTruncatesUplinkAndDownlink(t *testing.T) {
 func TestMeterSharedInboundDualCount(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 1000, 100, "user>>>u1", "strict"))
-	key, gotAcc, rate, ctr, inCtr, pairCtr, ok := m.accept(&C.Metadata{InUser: "u1", InName: "sh-ss-21003"})
-	if !ok || key != "user>>>u1" || gotAcc != acc || rate != 100 {
-		t.Fatalf("accept: ok %v key %q acc %v rate %d", ok, key, gotAcc == acc, rate)
-	}
+	ctr, inCtr, pairCtr := m.accept(&C.Metadata{InUser: "u1", InName: "sh-ss-21003"})
 	if inCtr == nil || pairCtr == nil {
 		t.Fatal("shared listener must get an inbound-level counter and a user×inbound pair counter")
 	}
 	peer, local := net.Pipe()
 	defer peer.Close()
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: rate, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr}
+	conn := &meterConn{m: m, Conn: local, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr}
 	if _, err := conn.Write(make([]byte, 400)); err != nil {
 		t.Fatal(err)
 	}
 	if ctr.down.Load() != 400 || inCtr.down.Load() != 400 || pairCtr.down.Load() != 400 {
 		t.Fatalf("dual count: user %d inbound %d pair %d", ctr.down.Load(), inCtr.down.Load(), pairCtr.down.Load())
 	}
-	if acc.used.Load() != 400 {
-		t.Fatalf("billing must count once, used %d", acc.used.Load())
-	}
 	// Nowhere 连接没有 InUser，键本身就是入站级，不再带辅助计数器。
-	if _, _, _, _, nwIn, nwPair, _ := m.accept(&C.Metadata{InName: "nw-abcd1234-20000"}); nwIn != nil || nwPair != nil {
-		t.Fatal("nowhere conn must not dual count")
+	if nwCtr, nwIn, nwPair := m.accept(&C.Metadata{InName: "nw-abcd1234-20000"}); nwCtr == nil || nwIn != nil || nwPair != nil {
+		t.Fatal("nowhere conn must only count at inbound level")
 	}
 	// 计费键、入站级键与联合键都随 stats 上报，面板各取所需。
 	counters := m.counters()
@@ -169,196 +85,38 @@ func TestMeterSharedInboundDualCount(t *testing.T) {
 	}
 }
 
-func TestMeterRateFloorsToGrant(t *testing.T) {
+func TestMeterUDPCountsWithoutDropping(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 1000, 200, "inbound>>>nw", "strict"))
-	peer, local := net.Pipe()
-	defer peer.Close()
-	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: 200, ctr: m.counterLocked("inbound>>>nw")}
-	n, err := conn.Write(make([]byte, 800))
-	if !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("err %v", err)
-	}
-	if n != 500 || acc.used.Load() != 1000 {
-		t.Fatalf("n %d used %d", n, acc.used.Load())
-	}
-}
-
-func TestMeterUDPDropsAndTrips(t *testing.T) {
-	now := time.Unix(1_000, 0)
-	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 100, 100, "user>>>u1", "strict"))
 	ctr := m.counterLocked("user>>>u1")
 	inner := &fakePacket{data: make([]byte, 80)}
-	pkt := &meterPacket{m: m, UDPPacket: inner, acc: acc, rate: 100, ctr: ctr}
-	other := &meterConn{m: m, Conn: &closeProbe{}, acc: acc}
-	m.track(acc, other, "in")
+	pkt := &meterPacket{m: m, UDPPacket: inner, ctr: ctr}
 	if got := pkt.Data(); len(got) != 80 || inner.dropped {
-		t.Fatalf("first packet len %d dropped %v", len(got), inner.dropped)
+		t.Fatalf("packet len %d dropped %v", len(got), inner.dropped)
 	}
-	second := &fakePacket{data: make([]byte, 40)}
-	pkt2 := &meterPacket{m: m, UDPPacket: second, acc: acc, rate: 100, ctr: ctr}
-	if got := pkt2.Data(); got != nil || !second.dropped {
-		t.Fatalf("overflow must drop, got %d dropped %v", len(got), second.dropped)
-	}
-	if acc.used.Load() != 80 {
-		t.Fatalf("used %d, dropped packet must not be billed", acc.used.Load())
+	if got := pkt.Data(); len(got) != 80 {
+		t.Fatalf("second read len %d", len(got))
 	}
 	if ctr.up.Load() != 80 {
-		t.Fatalf("uplink %d", ctr.up.Load())
+		t.Fatalf("uplink %d, packet must count once", ctr.up.Load())
 	}
-	if !other.Conn.(*closeProbe).closed {
-		t.Fatal("trip must close every connection on the account")
+	if n, err := pkt.WriteBack(make([]byte, 30), nil); err != nil || n != 30 {
+		t.Fatalf("writeback n %d err %v", n, err)
 	}
-	back := &fakePacket{}
-	pkt3 := &meterPacket{m: m, UDPPacket: back, acc: acc, rate: 100, ctr: ctr}
-	if _, err := pkt3.WriteBack(make([]byte, 30), nil); err == nil {
-		t.Fatal("exhausted account must reject writeback")
+	if ctr.down.Load() != 30 {
+		t.Fatalf("downlink %d", ctr.down.Load())
 	}
 }
 
-func TestMeterStrictRejectsUnknownLooseAllows(t *testing.T) {
-	now := time.Unix(2_000, 0)
+func TestMeterCloseInbound(t *testing.T) {
+	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
-	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "other"}); ok {
-		t.Fatal("strict mode must reject an unknown key")
-	}
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
-		t.Fatal("known key must pass")
-	}
-	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "loose"))); err != nil {
-		t.Fatal(err)
-	}
-	key, acc, _, _, _, _, ok := m.accept(&C.Metadata{InName: "other"})
-	if !ok || acc != nil || key != "inbound>>>other" {
-		t.Fatalf("loose unknown: ok %v acc %v key %q", ok, acc != nil, key)
-	}
-}
-
-func TestMeterExpiryEpochTopUp(t *testing.T) {
-	now := time.Unix(3_000, 0)
-	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))
-	acc.used.Store(100)
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
-		t.Fatal("exhausted grant must reject")
-	}
-	if err := m.ApplySnapshot([]byte(`{"epoch":"e1","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s1","granted":250,"keys":{"inbound>>>nw":100}}]}`)); err != nil {
-		t.Fatal(err)
-	}
-	if acc.used.Load() != 100 || acc.granted.Load() != 250 {
-		t.Fatalf("top-up used %d granted %d", acc.used.Load(), acc.granted.Load())
-	}
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
-		t.Fatal("top-up must reopen")
-	}
-	now = now.Add(571 * time.Second)
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); ok {
-		t.Fatal("expired grant must reject")
-	}
-	acc.used.Store(40)
-	if err := m.ApplySnapshot([]byte(`{"epoch":"e2","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s1","granted":100,"keys":{"inbound>>>nw":100}}]}`)); err != nil {
-		t.Fatal(err)
-	}
-	if acc.used.Load() != 0 || acc.granted.Load() != 100 {
-		t.Fatalf("new epoch used %d granted %d", acc.used.Load(), acc.granted.Load())
-	}
-	if _, _, _, _, _, _, ok := m.accept(&C.Metadata{InName: "nw"}); !ok {
-		t.Fatal("new epoch must pass")
-	}
-}
-
-func TestMeterLooseOpensAfterDisconnect(t *testing.T) {
-	now := time.Unix(4_000, 0)
-	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 10, 100, "inbound>>>nw", "loose"))
-	m.setConnected(true)
-	if m.looseBypass() {
-		t.Fatal("connected loose mode must still enforce")
-	}
-	m.setConnected(false)
-	now = now.Add(31 * time.Second)
-	if !m.looseBypass() {
-		t.Fatal("loose mode must open 30s after disconnect")
-	}
-	peer, local := net.Pipe()
-	defer peer.Close()
-	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: 100, ctr: m.counterLocked("inbound>>>nw")}
-	n, err := conn.Write(make([]byte, 50))
-	if err != nil || n != 50 {
-		t.Fatalf("loose write n %d err %v", n, err)
-	}
-	if acc.used.Load() != 50 {
-		t.Fatalf("loose usage %d", acc.used.Load())
-	}
-}
-
-func TestMeterGrantedShrinksUnusedNotUsed(t *testing.T) {
-	now := time.Unix(5_000, 0)
-	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 500, 100, "inbound>>>nw", "strict"))
-	if err := m.ApplySnapshot([]byte(grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))); err != nil {
-		t.Fatal(err)
-	}
-	if acc.granted.Load() != 100 {
-		t.Fatalf("unused grant stayed %d", acc.granted.Load())
-	}
-	acc.used.Store(80)
-	if err := m.ApplySnapshot([]byte(grantJSON("s1", 50, 100, "inbound>>>nw", "strict"))); err != nil {
-		t.Fatal(err)
-	}
-	if acc.granted.Load() != 80 {
-		t.Fatalf("granted fell below used: %d", acc.granted.Load())
-	}
-}
-
-func TestMeterStarterSignalsAndCaps(t *testing.T) {
-	now := time.Unix(7_000, 0)
-	m := testMeter(&now)
-	raw := `{"epoch":"e1","mode":"strict","ttl_s":600,"low_water":50,"starter_bytes":100,"leases":[{"sub":"s1","starter":true,"keys":{"inbound>>>nw":100}}]}`
-	acc := mustGrant(t, m, raw)
-	if acc.granted.Load() != 100 || !acc.starter {
-		t.Fatalf("courtesy granted %d starter %v", acc.granted.Load(), acc.starter)
-	}
-	peer, local := net.Pipe()
-	defer peer.Close()
-	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: 100, ctr: m.counterLocked("inbound>>>nw")}
-	if _, err := conn.Write([]byte{1}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-m.wake:
-	default:
-		t.Fatal("first byte must wake")
-	}
-	n, err := conn.Write(make([]byte, 200))
-	if n != 99 || err == nil {
-		t.Fatalf("cap n %d err %v", n, err)
-	}
-}
-
-func TestMeterLowWaterSignals(t *testing.T) {
-	now := time.Unix(6_000, 0)
-	m := testMeter(&now)
-	acc := mustGrant(t, m, grantJSON("s1", 100, 100, "inbound>>>nw", "strict"))
-	peer, local := net.Pipe()
-	defer peer.Close()
-	go func() { _, _ = io.Copy(io.Discard, peer) }()
-	conn := &meterConn{m: m, Conn: local, acc: acc, rate: 100, ctr: m.counterLocked("inbound>>>nw")}
-	if _, err := conn.Write(make([]byte, 60)); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-m.wake:
-	default:
-		t.Fatal("balance under low water must wake a report")
+	a, b := &closeProbe{}, &closeProbe{}
+	m.track(a, "in-a")
+	m.track(b, "in-b")
+	m.closeInbound("in-a")
+	if !a.closed || b.closed {
+		t.Fatalf("closed a=%v b=%v", a.closed, b.closed)
 	}
 }
 

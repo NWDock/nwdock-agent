@@ -48,7 +48,6 @@ type desiredBody struct {
 	Shared     []sharedDesired  `json:"shared"`
 	Geo        []geoDesired     `json:"geo"`
 	RuleSets   []ruleSetDesired `json:"rule_sets"`
-	Quota      json.RawMessage  `json:"quota"`
 	Relays     []relaySpec      `json:"relays"`
 	LogLevel   string           `json:"log_level"`
 }
@@ -264,11 +263,6 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	// 入口转发与核心完全解耦：清单无条件下发，无论 serving 与核心状态如何都先应用；
 	// 之后核心重启、换核或配置失败都不影响已建立的入口转发。
 	relayApply(s.cfg.DataDir, body.Relays)
-	if len(body.Quota) > 0 && string(body.Quota) != "null" {
-		if err := traffic.ApplySnapshot(body.Quota); err != nil {
-			return err
-		}
-	}
 	want := normalizeCore(body.Core)
 	proc.mu.Lock()
 	defer proc.mu.Unlock()

@@ -45,7 +45,6 @@ const (
 	msgStats      = "stats"
 	msgDesiredReq = "desired_req"
 	msgDesired    = "desired"
-	msgQuota      = "quota"
 	// req/resp 对：面板主动拉起信息（重启结果、日志），带 id 应答；与 panel 侧常量逐字一致。
 	msgRestart       = "restart"
 	msgRestartResult = "restart_result"
@@ -227,16 +226,14 @@ func (s *session) closeConn() {
 }
 
 // serve 驱动整条会话：先上报用量再要 desired（失联期间的字节先入账），
-// 15s 心跳 + 保活 ping，60s stats，低水位时立刻再报一次。
-// 收到 desired 或 quota 即应用。返回即连接断开，由 Run 走退避重连。
+// 15s 心跳 + 保活 ping，60s stats，入口转发结束时刻立刻再报一次。
+// 收到 desired 即应用。返回即连接断开，由 Run 走退避重连。
 func (s *session) serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.closeConn)
 	defer stop()
 	defer s.closeConn()
-	traffic.setConnected(true)
-	defer traffic.setConnected(false)
 
-	// 先把上一轮还没入账的用量送出，面板再开新的预支轮次。
+	// 先把上一轮还没入账的用量送出，再要 desired。
 	if err := reportStats(ctx, s); err != nil {
 		logf(levelWarning, "%s", err.Error())
 	}
@@ -310,10 +307,6 @@ func (s *session) serve(ctx context.Context) error {
 				return frame.err
 			}
 			switch frame.msg.T {
-			case msgQuota:
-				if err := traffic.ApplySnapshot(frame.msg.D); err != nil {
-					logf(levelWarning, "%s", err.Error())
-				}
 			case msgDesired:
 				gotDesired = true
 				if err := s.applyDesired(ctx, frame.msg.D); err != nil {

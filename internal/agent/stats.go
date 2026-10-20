@@ -33,17 +33,11 @@ func collectStats(ctx context.Context, bin, api string) (map[string]int64, error
 	return counters, nil
 }
 
-func submitStats(ctx context.Context, s *session, counters map[string]int64, withQuota bool) error {
-	payload := map[string]any{"counters": counters}
-	if withQuota {
-		if usage, ok := traffic.usage(); ok {
-			payload["quota"] = usage
-		}
-	}
-	if len(counters) == 0 && payload["quota"] == nil {
+func submitStats(ctx context.Context, s *session, counters map[string]int64) error {
+	if len(counters) == 0 {
 		return nil
 	}
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(map[string]any{"counters": counters})
 	if err != nil {
 		return err
 	}
@@ -83,12 +77,12 @@ func reportCounters(ctx context.Context, s *session, core coreKind) error {
 		counters, err = collectStats(ctx, bin, coreAPIAddr())
 	default:
 		counters = relayCounters()
-		return submitStats(ctx, s, counters, true)
+		return submitStats(ctx, s, counters)
 	}
 	if err != nil {
 		return err
 	}
-	return submitStats(ctx, s, mergeRelayCounters(counters), core == coreMihomo)
+	return submitStats(ctx, s, mergeRelayCounters(counters))
 }
 
 // mergeRelayCounters 把入口转发累计并进核心 counters；转发与核心命名空间不重叠。

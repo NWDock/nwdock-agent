@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"encoding/json"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,70 +11,17 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-const (
-	quotaClockSkew  = 30 * time.Second
-	quotaLooseAfter = 30 * time.Second
-	quotaReportMin  = 500 * time.Millisecond
-)
+const statsNudgeMin = 500 * time.Millisecond
 
-// quotaSnapshot 是面板下发的本机额度。未使用部分可以下调，已计费字节不会被抹掉。
-type quotaSnapshot struct {
-	Epoch        string       `json:"epoch"`
-	Mode         string       `json:"mode"`
-	TTL          int          `json:"ttl_s"`
-	LowWater     int          `json:"low_water"`
-	StarterBytes int64        `json:"starter_bytes"`
-	Leases       []quotaLease `json:"leases"`
-}
-
-type quotaLease struct {
-	Sub       string         `json:"sub"`
-	Unlimited bool           `json:"unlimited"`
-	Starter   bool           `json:"starter"`
-	Granted   int64          `json:"granted"`
-	Keys      map[string]int `json:"keys"`
-}
-
-// quotaUsage 是节点上报的本轮次计费字节。
-type quotaUsage struct {
-	Epoch string           `json:"epoch"`
-	Used  map[string]int64 `json:"used"`
-}
-
-// trafficMeter 在入站与 clash-meta-nw 隧道之间按块计原始字节，并按预支额度截断。
-// 连接建立时记下账户指针，读写路径只做原子加减。
+// trafficMeter 在入站与 clash-meta-nw 隧道之间按块计原始字节。
+// 只计数，不截断；限额由面板在下一次 desired 收敛。
 type trafficMeter struct {
-	mu             sync.Mutex
-	epoch          string
-	mode           string
-	lowWater       int
-	starterBytes   int64
-	expires        time.Time
-	connected      bool
-	disconnectedAt time.Time
-	lastSignal     time.Time
-	accounts       map[string]*meterAccount
-	keys           map[string]meterKey
-	raw            map[string]*rawCounter
-	live           map[ioCloser]string
-	lastKey        string
-	wake           chan struct{}
-	now            func() time.Time
-}
-
-type meterKey struct {
-	sub  string
-	rate int64
-}
-
-type meterAccount struct {
-	sub       string
-	granted   atomic.Int64
-	used      atomic.Int64
-	lastTopUp atomic.Int64
-	unlimited bool
-	starter   bool
-	conns     map[ioCloser]struct{}
+	mu         sync.Mutex
+	raw        map[string]*rawCounter
+	live       map[ioCloser]string
+	lastSignal time.Time
+	wake       chan struct{}
+	now        func() time.Time
 }
 
 type rawCounter struct {
@@ -89,15 +35,10 @@ type ioCloser interface {
 
 func newTrafficMeter() *trafficMeter {
 	return &trafficMeter{
-		mode:         "strict",
-		lowWater:     50,
-		starterBytes: 1 << 20,
-		accounts:     map[string]*meterAccount{},
-		keys:         map[string]meterKey{},
-		raw:          map[string]*rawCounter{},
-		live:         map[ioCloser]string{},
-		wake:         make(chan struct{}, 1),
-		now:          time.Now,
+		raw:  map[string]*rawCounter{},
+		live: map[ioCloser]string{},
+		wake: make(chan struct{}, 1),
+		now:  time.Now,
 	}
 }
 
@@ -111,23 +52,15 @@ func (meterTunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	if metadata != nil {
 		inbound = metadata.InName
 	}
-	key, acc, rate, ctr, inCtr, pairCtr, ok := traffic.accept(metadata)
-	if !ok {
-		_ = conn.Close()
-		return
-	}
-	wrapped := &meterConn{m: traffic, Conn: conn, acc: acc, key: key, rate: rate, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr, inbound: inbound}
-	traffic.track(acc, wrapped, inbound)
+	ctr, inCtr, pairCtr := traffic.accept(metadata)
+	wrapped := &meterConn{m: traffic, Conn: conn, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr, inbound: inbound}
+	traffic.track(wrapped, inbound)
 	tunnel.Tunnel.HandleTCPConn(wrapped, metadata)
 }
 
 func (meterTunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
-	key, acc, rate, ctr, inCtr, pairCtr, ok := traffic.accept(metadata)
-	if !ok {
-		packet.Drop()
-		return
-	}
-	base := &meterPacket{m: traffic, UDPPacket: packet, acc: acc, rate: rate, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr, key: key}
+	ctr, inCtr, pairCtr := traffic.accept(metadata)
+	base := &meterPacket{m: traffic, UDPPacket: packet, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr}
 	var out C.UDPPacket = base
 	if in, ok := packet.(C.UDPPacketInAddr); ok {
 		out = &meterPacketIn{meterPacket: base, in: in.InAddr()}
@@ -137,7 +70,7 @@ func (meterTunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
 
 func (meterTunnel) NatTable() C.NatTable { return tunnel.Tunnel.NatTable() }
 
-func quotaKeyOf(md *C.Metadata) string {
+func trafficKeyOf(md *C.Metadata) string {
 	if md == nil {
 		return ""
 	}
@@ -150,40 +83,18 @@ func quotaKeyOf(md *C.Metadata) string {
 	return ""
 }
 
-// accept 决定这条连接能否进入隧道，并返回缓存用的账户与计数器。
-// 共享监听器的连接带两个只统计的辅助计数器（不影响准入与配额）：
+// accept 返回这条连接要记的计数器。
+// 共享监听器的连接带两个只统计的辅助计数器（不影响计费）：
 // inbound>>> 入站级实际流量键（计费仍只按 user>>> 键），
 // pair>>>用户>>>监听名 用户×入站联合键，供面板落节点×用户明细。
 // Nowhere 连接没有 InUser、键本身就是入站级，两个辅助计数器都为 nil。
-func (m *trafficMeter) accept(md *C.Metadata) (string, *meterAccount, int64, *rawCounter, *rawCounter, *rawCounter, bool) {
-	key := quotaKeyOf(md)
+func (m *trafficMeter) accept(md *C.Metadata) (*rawCounter, *rawCounter, *rawCounter) {
+	key := trafficKeyOf(md)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.lastKey = key
-	open := m.looseOpenLocked()
-	ref, known := m.keys[key]
-	if key == "" || !known {
-		if m.mode == "loose" || open {
-			return key, nil, 100, m.counterLocked(key), m.sharedInboundCounterLocked(md), m.sharedPairCounterLocked(md), true
-		}
-		return key, nil, 0, nil, nil, nil, false
-	}
-	acc := m.accounts[ref.sub]
-	if acc == nil {
-		return key, nil, 0, nil, nil, nil, false
-	}
-	if acc.unlimited || open {
-		return key, acc, ref.rate, m.counterLocked(key), m.sharedInboundCounterLocked(md), m.sharedPairCounterLocked(md), true
-	}
-	if m.expiredLocked() || acc.granted.Load() <= acc.used.Load() {
-		return key, acc, ref.rate, m.counterLocked(key), nil, nil, false
-	}
-	return key, acc, ref.rate, m.counterLocked(key), m.sharedInboundCounterLocked(md), m.sharedPairCounterLocked(md), true
+	return m.counterLocked(key), m.sharedInboundCounterLocked(md), m.sharedPairCounterLocked(md)
 }
 
-// sharedInboundCounterLocked 给共享监听器的连接附加入站级计数器：按节点统计
-// 实际流量需要 inbound>>><监听名>。Nowhere 连接没有 InUser、键本身就是
-// 入站级，不再需要第二个计数器。
 func (m *trafficMeter) sharedInboundCounterLocked(md *C.Metadata) *rawCounter {
 	if md == nil || md.InUser == "" || md.InName == "" {
 		return nil
@@ -191,9 +102,6 @@ func (m *trafficMeter) sharedInboundCounterLocked(md *C.Metadata) *rawCounter {
 	return m.counterLocked("inbound>>>" + md.InName)
 }
 
-// sharedPairCounterLocked 给共享监听器的连接附加用户×入站联合计数器：
-// pair>>><用户>>><监听名>。计费仍只按 user>>> 键，这个键只供面板落
-// 节点×用户明细，不影响准入与配额。Nowhere 连接没有 InUser，不需要。
 func (m *trafficMeter) sharedPairCounterLocked(md *C.Metadata) *rawCounter {
 	if md == nil || md.InUser == "" || md.InName == "" {
 		return nil
@@ -213,35 +121,15 @@ func (m *trafficMeter) counterLocked(key string) *rawCounter {
 	return ctr
 }
 
-func (m *trafficMeter) looseOpenLocked() bool {
-	if m.mode != "loose" || m.connected || m.disconnectedAt.IsZero() {
-		return false
-	}
-	return m.now().Sub(m.disconnectedAt) > quotaLooseAfter
-}
-
-func (m *trafficMeter) expiredLocked() bool {
-	return !m.expires.IsZero() && !m.now().Before(m.expires)
-}
-
-func (m *trafficMeter) track(acc *meterAccount, conn ioCloser, inbound string) {
+func (m *trafficMeter) track(conn ioCloser, inbound string) {
 	m.mu.Lock()
 	m.live[conn] = inbound
-	if acc != nil {
-		if acc.conns == nil {
-			acc.conns = map[ioCloser]struct{}{}
-		}
-		acc.conns[conn] = struct{}{}
-	}
 	m.mu.Unlock()
 }
 
-func (m *trafficMeter) detach(acc *meterAccount, conn ioCloser) {
+func (m *trafficMeter) detach(conn ioCloser) {
 	m.mu.Lock()
 	delete(m.live, conn)
-	if acc != nil {
-		delete(acc.conns, conn)
-	}
 	m.mu.Unlock()
 }
 
@@ -258,142 +146,6 @@ func (m *trafficMeter) closeInbound(name string) {
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
-}
-
-func (m *trafficMeter) trip(acc *meterAccount) {
-	if acc == nil {
-		return
-	}
-	m.mu.Lock()
-	conns := make([]ioCloser, 0, len(acc.conns))
-	for conn := range acc.conns {
-		conns = append(conns, conn)
-	}
-	m.mu.Unlock()
-	for _, conn := range conns {
-		_ = conn.Close()
-	}
-	m.signal()
-}
-
-func (m *trafficMeter) setConnected(on bool) {
-	m.mu.Lock()
-	m.connected = on
-	if !on {
-		m.disconnectedAt = m.now()
-	}
-	m.mu.Unlock()
-}
-
-// ApplySnapshot 应用面板的额度快照。未使用的 granted 可以下调，但不能低于已经计费的字节。
-// 换 epoch 清零本轮用量。starter 在本地已用之上再给起步额度。
-func (m *trafficMeter) ApplySnapshot(raw []byte) error {
-	var snap quotaSnapshot
-	if err := json.Unmarshal(raw, &snap); err != nil {
-		return err
-	}
-	if snap.Mode != "loose" {
-		snap.Mode = "strict"
-	}
-	if snap.LowWater <= 0 || snap.LowWater > 100 {
-		snap.LowWater = 50
-	}
-	ttl := time.Duration(snap.TTL) * time.Second
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	now := m.now()
-	m.mu.Lock()
-	fresh := snap.Epoch != "" && snap.Epoch != m.epoch
-	m.epoch = snap.Epoch
-	m.mode = snap.Mode
-	m.lowWater = snap.LowWater
-	if snap.StarterBytes > 0 {
-		m.starterBytes = snap.StarterBytes
-	} else if m.starterBytes <= 0 {
-		m.starterBytes = 1 << 20
-	}
-	m.expires = now.Add(ttl - quotaClockSkew)
-	keep := map[string]bool{}
-	m.keys = map[string]meterKey{}
-	var drop []ioCloser
-	for _, lease := range snap.Leases {
-		if lease.Sub == "" {
-			continue
-		}
-		keep[lease.Sub] = true
-		acc := m.accounts[lease.Sub]
-		if acc == nil {
-			acc = &meterAccount{sub: lease.Sub, conns: map[ioCloser]struct{}{}}
-			m.accounts[lease.Sub] = acc
-		}
-		acc.unlimited = lease.Unlimited
-		acc.starter = lease.Starter && !lease.Unlimited
-		prev := acc.granted.Load()
-		used := acc.used.Load()
-		if fresh {
-			acc.used.Store(0)
-			used = 0
-			prev = 0
-		}
-		var next int64
-		switch {
-		case lease.Unlimited:
-			next = 0
-		case acc.starter:
-			extra := m.starterBytes
-			if extra <= 0 {
-				extra = 1 << 20
-			}
-			next = used + extra
-			acc.lastTopUp.Store(extra)
-		default:
-			next = lease.Granted
-			if next < used {
-				next = used
-			}
-			switch {
-			case fresh:
-				acc.lastTopUp.Store(next)
-			case next > prev:
-				acc.lastTopUp.Store(next - prev)
-			}
-		}
-		acc.granted.Store(next)
-		for key, rate := range lease.Keys {
-			if rate <= 0 {
-				rate = 100
-			}
-			m.keys[key] = meterKey{sub: lease.Sub, rate: int64(rate)}
-		}
-	}
-	for sub, acc := range m.accounts {
-		if keep[sub] {
-			continue
-		}
-		for conn := range acc.conns {
-			drop = append(drop, conn)
-		}
-		delete(m.accounts, sub)
-	}
-	m.mu.Unlock()
-	for _, conn := range drop {
-		_ = conn.Close()
-	}
-	return nil
-}
-
-func (m *trafficMeter) usage() (quotaUsage, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.epoch == "" {
-		return quotaUsage{}, false
-	}
-	used := map[string]int64{}
-	for id, acc := range m.accounts {
-		used[id] = acc.used.Load()
-	}
-	return quotaUsage{Epoch: m.epoch, Used: used}, true
 }
 
 func (m *trafficMeter) counters() map[string]int64 {
@@ -417,7 +169,7 @@ func (m *trafficMeter) counters() map[string]int64 {
 func (m *trafficMeter) signal() {
 	now := m.now()
 	m.mu.Lock()
-	if now.Sub(m.lastSignal) < quotaReportMin {
+	if now.Sub(m.lastSignal) < statsNudgeMin {
 		m.mu.Unlock()
 		return
 	}
@@ -429,77 +181,9 @@ func (m *trafficMeter) signal() {
 	}
 }
 
-func (m *trafficMeter) maybeSignal(acc *meterAccount) {
-	if acc == nil || acc.unlimited {
-		return
-	}
-	if acc.starter && acc.used.Load() > 0 {
-		m.signal()
-	}
-	remain := acc.granted.Load() - acc.used.Load()
-	top := acc.lastTopUp.Load()
-	m.mu.Lock()
-	water := int64(m.lowWater)
-	m.mu.Unlock()
-	if remain <= 0 || (top > 0 && remain*100 < top*water) {
-		m.signal()
-	}
-}
-
-func (m *trafficMeter) looseBypass() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.looseOpenLocked()
-}
-
-// admit 在账户上扣计费字节，返回本次允许转发的原始字节。不足则截断到额度边界。
-// bill 为 false 时不扣账户（不限量、或宽松失联），调用方仍要自己记原始字节。
-func admit(acc *meterAccount, raw, rate int64, bill bool) int64 {
-	if raw <= 0 {
-		return 0
-	}
-	if acc == nil || acc.unlimited || !bill {
-		return raw
-	}
-	if rate <= 0 {
-		rate = 100
-	}
-	for {
-		used := acc.used.Load()
-		remain := acc.granted.Load() - used
-		if remain <= 0 {
-			return 0
-		}
-		maxRaw := remain * 100 / rate
-		if maxRaw <= 0 {
-			return 0
-		}
-		if maxRaw > raw {
-			maxRaw = raw
-		}
-		billed := maxRaw * rate / 100
-		if acc.used.CompareAndSwap(used, used+billed) {
-			return maxRaw
-		}
-	}
-}
-
-func refund(acc *meterAccount, raw, rate int64) {
-	if acc == nil || acc.unlimited || raw <= 0 {
-		return
-	}
-	if rate <= 0 {
-		rate = 100
-	}
-	acc.used.Add(-(raw * rate / 100))
-}
-
 type meterConn struct {
 	net.Conn
 	m       *trafficMeter
-	acc     *meterAccount
-	key     string
-	rate    int64
 	ctr     *rawCounter
 	inCtr   *rawCounter
 	pairCtr *rawCounter
@@ -536,16 +220,11 @@ func (c *meterConn) note(n int64, upload bool) {
 }
 
 func (c *meterConn) ReadBuffer(buffer *buf.Buffer) error {
-	before := buffer.Len()
 	n, err := buffer.ReadOnceFrom(c.Conn)
-	if n <= 0 {
-		return err
+	if n > 0 {
+		c.note(int64(n), true)
 	}
-	allow, cerr := c.consume(int64(n), err, true)
-	if allow < n {
-		buffer.Truncate(before + allow)
-	}
-	return cerr
+	return err
 }
 
 func (c *meterConn) WriteBuffer(buffer *buf.Buffer) error {
@@ -558,85 +237,32 @@ func (c *meterConn) WriteBuffer(buffer *buf.Buffer) error {
 
 func (c *meterConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if n <= 0 {
-		return n, err
+	if n > 0 {
+		c.note(int64(n), true)
 	}
-	return c.consume(int64(n), err, true)
-}
-
-func (c *meterConn) Write(p []byte) (int, error) {
-	if c.m.looseBypass() {
-		n, err := c.Conn.Write(p)
-		c.noteLoose(int64(n), false)
-		return n, err
-	}
-	allow := admit(c.acc, int64(len(p)), c.rate, c.acc != nil)
-	if allow <= 0 {
-		c.m.trip(c.acc)
-		return 0, net.ErrClosed
-	}
-	n, err := c.Conn.Write(p[:allow])
-	if gap := allow - int64(n); gap > 0 {
-		refund(c.acc, gap, c.rate)
-	}
-	c.note(int64(n), false)
-	if allow < int64(len(p)) {
-		c.m.trip(c.acc)
-		return n, net.ErrClosed
-	}
-	c.m.maybeSignal(c.acc)
 	return n, err
 }
 
-// consume 处理已经从对端读到的上行字节：超额部分丢弃，不转发给隧道。
-func (c *meterConn) consume(n int64, err error, upload bool) (int, error) {
-	if c.m.looseBypass() {
-		c.noteLoose(n, upload)
-		return int(n), err
+func (c *meterConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.note(int64(n), false)
 	}
-	allow := admit(c.acc, n, c.rate, c.acc != nil)
-	c.note(allow, upload)
-	if allow < n {
-		c.m.trip(c.acc)
-		if allow == 0 {
-			return 0, net.ErrClosed
-		}
-		return int(allow), net.ErrClosed
-	}
-	c.m.maybeSignal(c.acc)
-	return int(n), err
-}
-
-func (c *meterConn) noteLoose(n int64, upload bool) {
-	if n <= 0 {
-		return
-	}
-	c.note(n, upload)
-	if c.acc == nil || c.acc.unlimited {
-		return
-	}
-	rate := c.rate
-	if rate <= 0 {
-		rate = 100
-	}
-	c.acc.used.Add(n * rate / 100)
+	return n, err
 }
 
 func (c *meterConn) Close() error {
-	c.m.detach(c.acc, c)
+	c.m.detach(c)
 	return c.Conn.Close()
 }
 
-// meterPacket 给 UDP 计数。Data 计上行，WriteBack 计下行；额度不够就丢弃并熔断。
+// meterPacket 给 UDP 计数。Data 计上行，WriteBack 计下行。
 type meterPacket struct {
 	C.UDPPacket
 	m       *trafficMeter
-	acc     *meterAccount
-	rate    int64
 	ctr     *rawCounter
 	inCtr   *rawCounter
 	pairCtr *rawCounter
-	key     string
 	counted atomic.Bool
 }
 
@@ -674,49 +300,16 @@ func (p *meterPacket) Data() []byte {
 	if !p.counted.CompareAndSwap(false, true) {
 		return buf
 	}
-	allow := p.charge(int64(len(buf)), true)
-	if allow <= 0 {
-		p.UDPPacket.Drop()
-		return nil
-	}
-	if allow < int64(len(buf)) {
-		return buf[:allow]
-	}
+	p.note(int64(len(buf)), true)
 	return buf
 }
 
 func (p *meterPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
-	allow := p.charge(int64(len(b)), false)
-	if allow <= 0 {
-		return 0, net.ErrClosed
+	n, err := p.UDPPacket.WriteBack(b, addr)
+	if n > 0 {
+		p.note(int64(n), false)
 	}
-	if allow < int64(len(b)) {
-		b = b[:allow]
-	}
-	return p.UDPPacket.WriteBack(b, addr)
-}
-
-func (p *meterPacket) charge(raw int64, upload bool) int64 {
-	if p.m.looseBypass() {
-		p.note(raw, upload)
-		if p.acc != nil && !p.acc.unlimited && raw > 0 {
-			rate := p.rate
-			if rate <= 0 {
-				rate = 100
-			}
-			p.acc.used.Add(raw * rate / 100)
-		}
-		return raw
-	}
-	allow := admit(p.acc, raw, p.rate, p.acc != nil)
-	if allow < raw {
-		refund(p.acc, allow, p.rate)
-		p.m.trip(p.acc)
-		return 0
-	}
-	p.note(allow, upload)
-	p.m.maybeSignal(p.acc)
-	return allow
+	return n, err
 }
 
 type meterPacketIn struct {

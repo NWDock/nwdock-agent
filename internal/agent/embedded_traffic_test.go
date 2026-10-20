@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,11 +19,10 @@ import (
 	"github.com/metacubex/mihomo/listener/inbound"
 )
 
-const quotaTestPassword = "0123456789abcdef0123456789abcdef"
+const trafficTestPassword = "0123456789abcdef0123456789abcdef"
 
-func TestEmbeddedNowhereCutsAtGrant(t *testing.T) {
-	const grant int64 = 4 << 20
-	const push int64 = 10 << 20
+func TestEmbeddedNowhereCountsAllTraffic(t *testing.T) {
+	const total int64 = 10 << 20
 	resetTraffic()
 	t.Cleanup(resetTraffic)
 
@@ -40,7 +40,7 @@ listeners:
     alpn: [nw2]
 rules:
   - MATCH,DIRECT
-`, port, quotaTestPassword)
+`, port, trafficTestPassword)
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -50,16 +50,10 @@ rules:
 		t.Fatal(err)
 	}
 	t.Cleanup(rt.Stop)
-	if err := traffic.ApplySnapshot([]byte(fmt.Sprintf(
-		`{"epoch":"e","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s","granted":%d,"keys":{"inbound>>>nw":100}}]}`,
-		grant,
-	))); err != nil {
-		t.Fatal(err)
-	}
 
 	client, err := outbound.NewNowhereV2(outbound.NowhereOption{
 		Name: "c", Server: "127.0.0.1", Port: port,
-		Password: quotaTestPassword, SkipCertVerify: true,
+		Password: trafficTestPassword, SkipCertVerify: true,
 		ALPN: []string{"nw2"},
 		Up:   "tcp", Down: "tcp",
 	})
@@ -73,18 +67,17 @@ rules:
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeUntilStop(t, conn, push)
+	writeUntilStop(t, conn, total)
 	_ = conn.Close()
-	waitSink(t, sink, grant)
-	if used := billed("s"); used != grant {
-		t.Fatalf("billed %d want %d counters %v", used, grant, traffic.counters())
+	waitSink(t, sink, total)
+	if got := counterValue("inbound>>>nw>>>traffic>>>uplink"); got != total {
+		t.Fatalf("uplink counter %d want %d counters %v", got, total, traffic.counters())
 	}
 }
 
-// nw3 默认栈：监听不写 alpn（核心默认 nw3），客户端同样不写 up/down，配额截断口径不变。
-func TestEmbeddedNowhereNw3CutsAtGrant(t *testing.T) {
-	const grant int64 = 4 << 20
-	const push int64 = 10 << 20
+// nw3 默认栈：监听不写 alpn（核心默认 nw3），客户端同样不写 up/down，计数口径不变。
+func TestEmbeddedNowhereNw3CountsAllTraffic(t *testing.T) {
+	const total int64 = 10 << 20
 	resetTraffic()
 	t.Cleanup(resetTraffic)
 
@@ -101,7 +94,7 @@ listeners:
     password: %s
 rules:
   - MATCH,DIRECT
-`, port, quotaTestPassword)
+`, port, trafficTestPassword)
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -111,16 +104,10 @@ rules:
 		t.Fatal(err)
 	}
 	t.Cleanup(rt.Stop)
-	if err := traffic.ApplySnapshot([]byte(fmt.Sprintf(
-		`{"epoch":"e","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"s","granted":%d,"keys":{"inbound>>>nw3":100}}]}`,
-		grant,
-	))); err != nil {
-		t.Fatal(err)
-	}
 
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
 		Name: "c", Server: "127.0.0.1", Port: port,
-		Password: quotaTestPassword, SkipCertVerify: true,
+		Password: trafficTestPassword, SkipCertVerify: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -132,15 +119,16 @@ rules:
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeUntilStop(t, conn, push)
+	writeUntilStop(t, conn, total)
 	_ = conn.Close()
-	waitSink(t, sink, grant)
-	if used := billed("s"); used != grant {
-		t.Fatalf("billed %d want %d counters %v", used, grant, traffic.counters())
+	waitSink(t, sink, total)
+	if got := counterValue("inbound>>>nw3>>>traffic>>>uplink"); got != total {
+		t.Fatalf("uplink counter %d want %d counters %v", got, total, traffic.counters())
 	}
 }
 
-func TestEmbeddedUserListenersCutAtGrant(t *testing.T) {
+func TestEmbeddedUserListenersCountAllTraffic(t *testing.T) {
+	const total int64 = 1 << 20
 	resetTraffic()
 	t.Cleanup(func() {
 		resetTraffic()
@@ -164,13 +152,6 @@ func TestEmbeddedUserListenersCutAtGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	const uuid = "01234567-89ab-cdef-0123-456789abcdef"
-	const grant int64 = 256 << 10
-	if err := traffic.ApplySnapshot([]byte(fmt.Sprintf(
-		`{"epoch":"e","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"u","granted":%d,"keys":{"user>>>test":100,"user>>>%s":100}}]}`,
-		grant, uuid,
-	))); err != nil {
-		t.Fatal(err)
-	}
 
 	vlessIn, err := inbound.NewVless(&inbound.VlessOption{
 		BaseOption:  inbound.BaseOption{NameStr: "vless-in", Listen: "127.0.0.1", Port: "0"},
@@ -185,7 +166,7 @@ func TestEmbeddedUserListenersCutAtGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = vlessIn.Close() })
-	pushThrough(t, "vless", grant, func(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	pushThrough(t, "vless", total, func(ctx context.Context, host string, port uint16) (net.Conn, error) {
 		addr := netip.MustParseAddrPort(vlessIn.Address())
 		client, err := outbound.NewVless(outbound.VlessOption{
 			Name: "vless-out", Server: addr.Addr().String(), Port: int(addr.Port()),
@@ -211,14 +192,7 @@ func TestEmbeddedUserListenersCutAtGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = anyIn.Close() })
-	// 第二个协议换一轮额度，避免和 vless 共用已用尽的账户。
-	if err := traffic.ApplySnapshot([]byte(fmt.Sprintf(
-		`{"epoch":"e2","mode":"strict","ttl_s":600,"low_water":50,"leases":[{"sub":"u","granted":%d,"keys":{"user>>>test":100,"user>>>%s":100}}]}`,
-		grant, uuid,
-	))); err != nil {
-		t.Fatal(err)
-	}
-	pushThrough(t, "anytls", grant, func(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	pushThrough(t, "anytls", total, func(ctx context.Context, host string, port uint16) (net.Conn, error) {
 		addr := netip.MustParseAddrPort(anyIn.Address())
 		client, err := outbound.NewAnyTLS(outbound.AnyTLSOption{
 			Name: "anytls-out", Server: addr.Addr().String(), Port: int(addr.Port()),
@@ -232,21 +206,36 @@ func TestEmbeddedUserListenersCutAtGrant(t *testing.T) {
 	})
 }
 
-func pushThrough(t *testing.T, label string, grant int64, dial func(context.Context, string, uint16) (net.Conn, error)) {
+func pushThrough(t *testing.T, label string, total int64, dial func(context.Context, string, uint16) (net.Conn, error)) {
 	t.Helper()
+	before := userUplink()
 	sunk, port := listenSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	conn, err := dial(ctx, "127.0.0.1", uint16(port))
 	if err != nil {
-		t.Fatalf("%s dial: %v counters %v last %q", label, err, traffic.counters(), traffic.lastKey)
+		t.Fatalf("%s dial: %v counters %v", label, err, traffic.counters())
 	}
-	writeUntilStop(t, conn, grant*4)
+	writeUntilStop(t, conn, total)
 	_ = conn.Close()
-	waitSink(t, sunk, grant)
-	if used := billed("u"); used != grant {
-		t.Fatalf("%s billed %d want %d counters %v last %q", label, used, grant, traffic.counters(), traffic.lastKey)
+	waitSink(t, sunk, total)
+	if got := userUplink() - before; got != total {
+		t.Fatalf("%s user uplink %d want %d counters %v", label, got, total, traffic.counters())
 	}
+}
+
+func userUplink() int64 {
+	var total int64
+	for name, value := range traffic.counters() {
+		if strings.HasPrefix(name, "user>>>") && strings.HasSuffix(name, ">>>traffic>>>uplink") {
+			total += value
+		}
+	}
+	return total
+}
+
+func counterValue(name string) int64 {
+	return traffic.counters()[name]
 }
 
 func listenSink(t *testing.T) (*atomic.Int64, int) {
@@ -307,21 +296,13 @@ func waitSink(t *testing.T, sunk *atomic.Int64, want int64) {
 	for time.Now().Before(deadline) {
 		if sunk.Load() >= want {
 			if sunk.Load() != want {
-				t.Fatalf("sink %d want %d counters %v last %q", sunk.Load(), want, traffic.counters(), traffic.lastKey)
+				t.Fatalf("sink %d want %d counters %v", sunk.Load(), want, traffic.counters())
 			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("sink %d want %d counters %v last %q", sunk.Load(), want, traffic.counters(), traffic.lastKey)
-}
-
-func billed(sub string) int64 {
-	usage, ok := traffic.usage()
-	if !ok {
-		return -1
-	}
-	return usage.Used[sub]
+	t.Fatalf("sink %d want %d counters %v", sunk.Load(), want, traffic.counters())
 }
 
 func resetTraffic() {
