@@ -42,7 +42,7 @@ jobs:
           submodules: true
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.26.10"
           cache-dependency-path: go.sum
       - name: Build agent
         env:
@@ -71,7 +71,7 @@ jobs:
           path: src
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27"
+          go-version: "1.27.3"
       - name: Build xray
         working-directory: src
         env:
@@ -97,14 +97,14 @@ jobs:
           path: src
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.10"
       - name: Build sing-box
         working-directory: src
         env:
           CGO_ENABLED: "0"
           GOWORK: "off"
         run: |
-          # Go 1.25 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
+          # Go 1.25+ 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
           tags="$(tr ',' '\n' < release/DEFAULT_BUILD_TAGS_OTHERS | grep -v -x -E 'badlinkname|tfogo_checklinkname0' | tr '\n' ',' | sed 's/,$//'),with_v2ray_api"
           go build -trimpath \
             -tags "${tags}" \

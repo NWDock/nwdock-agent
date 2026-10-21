@@ -8,7 +8,8 @@ ARG MIHOMO_TAG=v2.2.1
 ARG SINGBOX_TAG=v2.2.1
 ARG GEO_TAG=202610052207
 
-FROM golang:1.26-alpine AS agent
+FROM golang:1.26.10-alpine AS agent
+RUN go version
 RUN apk add --no-cache git
 WORKDIR /src
 ARG MIHOMO_TAG=v2.2.1
@@ -22,7 +23,8 @@ RUN CGO_ENABLED=0 GOWORK=off go build -trimpath \
     -o /out/agent ./cmd/agent
 
 # Xray 的 go.mod 要求 Go 1.27，不能跟 agent 一样用 1.26。
-FROM golang:1.27-alpine AS xray
+FROM golang:1.27.3-alpine AS xray
+RUN go version
 RUN apk add --no-cache git
 ARG XRAY_TAG=v2.2.1
 WORKDIR /src
@@ -30,13 +32,14 @@ RUN git clone --depth 1 --branch "${XRAY_TAG}" https://github.com/ohmycggk/Xray-
 ENV GOWORK=off
 RUN CGO_ENABLED=0 go build -trimpath -o /out/xray ./main
 
-FROM golang:1.25.12-alpine AS singbox
+FROM golang:1.26.10-alpine AS singbox
+RUN go version
 RUN apk add --no-cache git
 ARG SINGBOX_TAG=v2.2.1
 WORKDIR /src
 RUN git clone --depth 1 --branch "${SINGBOX_TAG}" https://github.com/ohmycggk/sing-box.git .
 ENV GOWORK=off
-# Go 1.25 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
+# Go 1.25+ 拒绝 badlinkname。流量统计仍要 with_v2ray_api，缺它会在 run 期回滚。
 RUN tags="$(tr ',' '\n' < release/DEFAULT_BUILD_TAGS_OTHERS | grep -v -x -E 'badlinkname|tfogo_checklinkname0' | tr '\n' ',' | sed 's/,$//'),with_v2ray_api" \
     && CGO_ENABLED=0 go build -trimpath \
     -tags "${tags}" \
