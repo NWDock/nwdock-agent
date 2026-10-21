@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -241,12 +243,17 @@ func appendRawArray(existing json.RawMessage, extra []json.RawMessage) (json.Raw
 	return json.Marshal(items)
 }
 
+// errWGCFEndpointStale 表示身份文件里的出口地址带端口。旧版本把注册响应的 v4/v6
+// （形如 162.159.192.2:0）原样存下，端口信息已经丢失，只能换一个身份重注册。
+var errWGCFEndpointStale = errors.New("wgcf endpoint carries a port")
+
+// 同一 tag 已有身份文件就复用，不重复注册；旧格式（endpoint 带端口）视为过期重注册。
 func ensureWGCF(ctx context.Context, dir, tag string) (wgcfIdentity, error) {
 	id, err := loadWGCF(dir, tag)
 	if err == nil {
 		return id, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errWGCFEndpointStale) {
 		return wgcfIdentity{}, err
 	}
 	privateKey, publicKey, err := newWGCFKey()
@@ -289,7 +296,7 @@ func loadWGCF(dir, tag string) (wgcfIdentity, error) {
 		return wgcfIdentity{}, fmt.Errorf("wgcf identity %s is unreadable", tag)
 	}
 	if err := id.validate(); err != nil {
-		return wgcfIdentity{}, fmt.Errorf("wgcf identity %s is unreadable", tag)
+		return wgcfIdentity{}, fmt.Errorf("wgcf identity %s is unreadable: %w", tag, err)
 	}
 	return id, nil
 }
@@ -330,6 +337,9 @@ func (id wgcfIdentity) validate() error {
 	}
 	if id.Endpoint == "" || id.Port < 1 || id.Port > 65535 {
 		return errors.New("wgcf endpoint")
+	}
+	if !bareWGCFHost(id.Endpoint) {
+		return errWGCFEndpointStale
 	}
 	if len(id.Addresses) == 0 || len(id.Reserved) != 3 {
 		return errors.New("wgcf identity")
@@ -480,15 +490,9 @@ func parseWGCFRegistration(payload []byte) (wgcfIdentity, error) {
 	if err != nil {
 		return wgcfIdentity{}, err
 	}
-	endpoint := strings.TrimSpace(peer.Endpoint.V4)
-	if endpoint == "" {
-		endpoint = strings.TrimSpace(peer.Endpoint.V6)
-	}
-	if endpoint == "" {
-		endpoint = strings.TrimSpace(peer.Endpoint.Host)
-	}
-	if endpoint == "" {
-		return wgcfIdentity{}, fmt.Errorf("wgcf register: response")
+	endpoint, port, err := warpEndpoint(peer.Endpoint.V4, peer.Endpoint.V6, peer.Endpoint.Host, peer.Endpoint.Ports)
+	if err != nil {
+		return wgcfIdentity{}, err
 	}
 	addresses, err := localPrefixes(body.Config.Interface.Addresses.V4, body.Config.Interface.Addresses.V6)
 	if err != nil || len(addresses) == 0 {
@@ -499,10 +503,69 @@ func parseWGCFRegistration(payload []byte) (wgcfIdentity, error) {
 		Token:         body.Token,
 		PeerPublicKey: base64.StdEncoding.EncodeToString(peerKey),
 		Endpoint:      endpoint,
-		Port:          warpPort(peer.Endpoint.Ports),
+		Port:          port,
 		Addresses:     addresses,
 		Reserved:      reserved,
 	}, nil
+}
+
+// warpEndpoint 从注册响应里取出口主机与端口。Cloudflare 的 v4/v6 字段自带端口
+// （常见是 162.159.192.2:0），host 字段是 engage.cloudflareclient.com:2408；
+// 三者都要拆掉端口，端口为 0 时回落到 ports 里的 2408。
+func warpEndpoint(v4, v6, host string, ports []int) (string, int, error) {
+	for _, value := range []string{v4, v6, host} {
+		name, port, ok := splitWGCEndpoint(value)
+		if !ok {
+			continue
+		}
+		if port == 0 {
+			port = warpPort(ports)
+		}
+		if !bareWGCFHost(name) {
+			continue
+		}
+		return name, port, nil
+	}
+	return "", 0, fmt.Errorf("wgcf register: response")
+}
+
+func splitWGCEndpoint(value string) (string, int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		value = value[1 : len(value)-1]
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil {
+		return value, 0, true
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 0 || port > 65535 || host == "" {
+		return "", 0, false
+	}
+	return host, port, true
+}
+
+func bareWGCFHost(value string) bool {
+	if _, err := netip.ParseAddr(value); err == nil {
+		return true
+	}
+	if value == "" || len(value) > 253 || strings.Contains(value, ":") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return strings.Contains(value, ".")
 }
 
 func decodeReserved(clientID string) ([]int, error) {

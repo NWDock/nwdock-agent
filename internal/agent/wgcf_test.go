@@ -23,7 +23,7 @@ func TestMaterializeWGCFRegistersOnce(t *testing.T) {
 			"client_id": "AQID",
 			"peers": [{
 				"public_key": "` + peer + `",
-				"endpoint": {"v4": "162.159.192.1", "host": "engage.cloudflareclient.com", "ports": [500, 2408]}
+				"endpoint": {"v4": "162.159.192.1:0", "v6": "[2606:4700:d0::a29f:c001]:0", "host": "engage.cloudflareclient.com:2408", "ports": [2408, 500]}
 			}],
 			"interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110:8f3a::1"}}
 		}
@@ -87,6 +87,9 @@ func TestMaterializeWGCFRegistersOnce(t *testing.T) {
 	if !strings.Contains(string(raw), `"token":"token-1"`) || !strings.Contains(text, `"private-key":"`) {
 		t.Fatal("identity or proxy missing key material")
 	}
+	if !strings.Contains(string(raw), `"endpoint":"162.159.192.1"`) || strings.Contains(string(raw), `"endpoint":"162.159.192.1:0"`) {
+		t.Fatalf("endpoint kept its port: %s", raw)
+	}
 
 	again, err := materializeWGCF(ctx, dir, coreMihomo, original)
 	if err != nil {
@@ -124,6 +127,9 @@ func TestMaterializeWGCFRegistersOnce(t *testing.T) {
 	if !strings.Contains(singText, `{"type":"direct","tag":"direct"}`) {
 		t.Fatalf("sibling outbound rewritten: %s", singText)
 	}
+	if !strings.Contains(singText, `"address":"162.159.192.1"`) || !strings.Contains(singText, `"port":2408`) {
+		t.Fatalf("sing-box peer endpoint is wrong: %s", singText)
+	}
 	if len(hits) != 2 {
 		t.Fatalf("registered again: %v", hits)
 	}
@@ -137,13 +143,66 @@ func TestMaterializeWGCFRegistersOnce(t *testing.T) {
 		t.Fatalf("rewrote config without wgcf: %s", same)
 	}
 
+	// 旧版本把 v4 原样存成 162.159.192.1:0；加载时应判过期并换新身份重新注册。
+	legacy := strings.Replace(string(raw), `"endpoint":"162.159.192.1"`, `"endpoint":"162.159.192.1:0"`, 1)
+	if legacy == string(raw) {
+		t.Fatal("failed to build legacy identity")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wgcf", "warp.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := materializeWGCF(ctx, dir, coreMihomo, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 4 {
+		t.Fatalf("legacy identity was not re-registered: %v", hits)
+	}
+	if !strings.Contains(string(renewed), `"server":"162.159.192.1"`) {
+		t.Fatalf("renewed identity is wrong: %s", renewed)
+	}
+	if after, err := os.ReadFile(filepath.Join(dir, "wgcf", "warp.json")); err != nil || strings.Contains(string(after), `:0"`) {
+		t.Fatalf("legacy identity was not rewritten: %s", after)
+	}
+
 	if err := os.WriteFile(filepath.Join(dir, "wgcf", "warp.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := materializeWGCF(ctx, dir, coreMihomo, original); err == nil {
 		t.Fatal("expected unreadable identity to fail")
 	}
-	if len(hits) != 2 {
+	if len(hits) != 4 {
 		t.Fatalf("corrupt identity registered again: %v", hits)
+	}
+}
+
+func TestWarpEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		v4, v6   string
+		host     string
+		ports    []int
+		want     string
+		wantPort int
+		wantErr  bool
+	}{
+		{"v4 带端口", "162.159.192.2:0", "[2606:4700:d0::a29f:c002]:0", "engage.cloudflareclient.com:2408", []int{2408, 500}, "162.159.192.2", 2408, false},
+		{"只有 v6", "", "[2606:4700:d0::a29f:c002]:0", "", []int{500, 2408}, "2606:4700:d0::a29f:c002", 2408, false},
+		{"回落到 host", "", "", "engage.cloudflareclient.com:2408", nil, "engage.cloudflareclient.com", 2408, false},
+		{"全空", "", "", "", []int{2408}, "", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, err := warpEndpoint(tt.v4, tt.v6, tt.host, tt.ports)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got %q %d", host, port)
+				}
+				return
+			}
+			if err != nil || host != tt.want || port != tt.wantPort {
+				t.Fatalf("got %q %d %v, want %q %d", host, port, err, tt.want, tt.wantPort)
+			}
+		})
 	}
 }
