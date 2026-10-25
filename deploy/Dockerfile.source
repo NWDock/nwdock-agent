@@ -3,16 +3,16 @@
 # 手工只 COPY 已有二进制时，用同目录的 Dockerfile.image。
 
 ARG VERSION=0.0.0
-ARG XRAY_TAG=v2.2.1
-ARG MIHOMO_TAG=v2.2.1
-ARG SINGBOX_TAG=v2.2.1
+ARG XRAY_TAG=v3.1.0
+ARG MIHOMO_TAG=v3.1.0
+ARG SINGBOX_TAG=v3.1.0
 ARG GEO_TAG=202610052207
 
 FROM golang:1.26.10-alpine AS agent
 RUN go version
 RUN apk add --no-cache git
 WORKDIR /src
-ARG MIHOMO_TAG=v2.2.1
+ARG MIHOMO_TAG=v3.1.0
 COPY go.mod go.sum ./
 COPY third_party/clash-meta-nw third_party/clash-meta-nw
 RUN GOWORK=off go mod download
@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOWORK=off go build -trimpath \
 FROM golang:1.27.3-alpine AS xray
 RUN go version
 RUN apk add --no-cache git
-ARG XRAY_TAG=v2.2.1
+ARG XRAY_TAG=v3.1.0
 WORKDIR /src
 RUN git clone --depth 1 --branch "${XRAY_TAG}" https://github.com/ohmycggk/Xray-core.git .
 ENV GOWORK=off
@@ -35,7 +35,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/xray ./main
 FROM golang:1.26.10-alpine AS singbox
 RUN go version
 RUN apk add --no-cache git
-ARG SINGBOX_TAG=v2.2.1
+ARG SINGBOX_TAG=v3.1.0
 WORKDIR /src
 RUN git clone --depth 1 --branch "${SINGBOX_TAG}" https://github.com/ohmycggk/sing-box.git .
 ENV GOWORK=off
@@ -60,9 +60,9 @@ RUN curl -fsSL -o geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/rel
 
 FROM debian:bookworm-slim
 ARG VERSION=0.0.0
-ARG XRAY_TAG=v2.2.1
-ARG MIHOMO_TAG=v2.2.1
-ARG SINGBOX_TAG=v2.2.1
+ARG XRAY_TAG=v3.1.0
+ARG MIHOMO_TAG=v3.1.0
+ARG SINGBOX_TAG=v3.1.0
 ARG GEO_TAG=202610052207
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
