@@ -4,7 +4,7 @@
 
 ARG VERSION=0.0.0
 ARG XRAY_TAG=v3.1.0
-ARG MIHOMO_TAG=v3.1.0
+ARG MIHOMO_TAG=v3.1.1
 ARG SINGBOX_TAG=v3.1.0
 ARG GEO_TAG=202610052207
 
@@ -12,7 +12,7 @@ FROM golang:1.26.10-alpine AS agent
 RUN go version
 RUN apk add --no-cache git
 WORKDIR /src
-ARG MIHOMO_TAG=v3.1.0
+ARG MIHOMO_TAG=v3.1.1
 COPY go.mod go.sum ./
 COPY third_party/clash-meta-nw third_party/clash-meta-nw
 RUN GOWORK=off go mod download
@@ -61,7 +61,7 @@ RUN curl -fsSL -o geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/rel
 FROM debian:bookworm-slim
 ARG VERSION=0.0.0
 ARG XRAY_TAG=v3.1.0
-ARG MIHOMO_TAG=v3.1.0
+ARG MIHOMO_TAG=v3.1.1
 ARG SINGBOX_TAG=v3.1.0
 ARG GEO_TAG=202610052207
 RUN apt-get update \

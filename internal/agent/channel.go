@@ -43,6 +43,7 @@ const (
 	msgClientAuth = "client_auth"
 	msgHeartbeat  = "heartbeat"
 	msgStats      = "stats"
+	msgStatsAck   = "stats_ack"
 	msgDesiredReq = "desired_req"
 	msgDesired    = "desired"
 	// req/resp 对：面板主动拉起信息（重启结果、日志），带 id 应答；与 panel 侧常量逐字一致。
@@ -51,6 +52,13 @@ const (
 	msgLogReq        = "log_req"
 	msgLogResp       = "log_resp"
 )
+
+// featureForwardV1 声明 agent 支持独立转发（desired.forwards、per-forward 计数）；
+// 随 desired_req 与 heartbeat 上报，旧面板忽略未知字段。
+const featureForwardV1 = "forward-v1"
+
+// channelFeatures 是 agent 能力声明，字段追加只增不删。
+var channelFeatures = []string{featureForwardV1}
 
 // message 是握手后每个 binary 帧的明文：紧凑 JSON {"t":"<type>","d":<任意 JSON>}。
 type message struct {
@@ -88,6 +96,56 @@ type session struct {
 	writeMu sync.Mutex
 	seqC2S  uint64
 	seqS2C  uint64
+
+	// statsAcks 路由面板的 stats_ack：batch id → 等待方。读循环投递，断线由
+	// dropStatsAcks 统一以错误收场，发送方不会永久挂住。
+	statsAckMu sync.Mutex
+	statsAcks  map[string]chan struct{}
+}
+
+// registerStatsAck 登记一个批次并返回等待通道；先登记后发送，避免 ack 先到被丢。
+func (s *session) registerStatsAck(batch string) chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.statsAckMu.Lock()
+	if s.statsAcks == nil {
+		s.statsAcks = map[string]chan struct{}{}
+	}
+	s.statsAcks[batch] = ch
+	s.statsAckMu.Unlock()
+	return ch
+}
+
+func (s *session) unregisterStatsAck(batch string) {
+	s.statsAckMu.Lock()
+	delete(s.statsAcks, batch)
+	s.statsAckMu.Unlock()
+}
+
+// resolveStatsAck 唤醒等待该批次的发送方；未知批次（旧面板或重复 ack）忽略。
+func (s *session) resolveStatsAck(batch string) {
+	s.statsAckMu.Lock()
+	ch, ok := s.statsAcks[batch]
+	s.statsAckMu.Unlock()
+	if ok {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// dropStatsAcks 断线时收场全部等待方。
+func (s *session) dropStatsAcks() {
+	s.statsAckMu.Lock()
+	waiters := s.statsAcks
+	s.statsAcks = nil
+	s.statsAckMu.Unlock()
+	for _, ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // normalizeChannelURL 把 AGENT_PANEL_ENDPOINTS 的一项归一化成 ws(s)://host[:port]/api/agent/channel。
@@ -181,7 +239,10 @@ func (s *session) readMessage(ctx context.Context) (message, error) {
 }
 
 func (s *session) requestDesired(ctx context.Context) error {
-	body, err := json.Marshal(map[string]string{"api": coreAPIAddr()})
+	body, err := json.Marshal(map[string]any{
+		"api":      coreAPIAddr(),
+		"features": channelFeatures,
+	})
 	if err != nil {
 		return err
 	}
@@ -195,6 +256,7 @@ func (s *session) sendHeartbeat(ctx context.Context) error {
 	if !startedAt.IsZero() {
 		startedAtText = startedAt.UTC().Format(time.RFC3339)
 	}
+	states, relayTotal, relayTruncated := relayHeartbeatStates()
 	body, err := json.Marshal(map[string]any{
 		"runtime":         s.cfg.Runtime,
 		"version":         Version,
@@ -204,7 +266,10 @@ func (s *session) sendHeartbeat(ctx context.Context) error {
 		"generation":      appliedGeneration(s.cfg.DataDir),
 		"error":           errorSummary(),
 		"image":           s.cfg.Image,
-		"relay":           relayStates(),
+		"features":        channelFeatures,
+		"relay":           states,
+		"relay_total":     relayTotal,
+		"relay_truncated": relayTruncated,
 	})
 	if err != nil {
 		return err
@@ -232,14 +297,10 @@ func (s *session) serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.closeConn)
 	defer stop()
 	defer s.closeConn()
+	defer s.dropStatsAcks()
 
-	// 先把上一轮还没入账的用量送出，再要 desired。
-	if err := reportStats(ctx, s); err != nil {
-		logf(levelWarning, "%s", err.Error())
-	}
-	if err := s.requestDesired(ctx); err != nil {
-		return err
-	}
+	// 读协程必须先于首次用量上报起来：上报要等面板 stats_ack 确认，
+	// 而 ack 只能由读协程收到，否则开局就白等一个超时。
 	// 缓冲要盖过一次 ping 等待（20s）里面板可能塞来的帧。日志泵 2s 一帧，
 	// 缓冲只有 8 时读协程会堵在入队、离开 Read，pong 和 close 都收不到。
 	inbox := make(chan inboxFrame, 32)
@@ -248,6 +309,17 @@ func (s *session) serve(ctx context.Context) error {
 	go func() {
 		for {
 			msg, err := s.readMessage(readerCtx)
+			// stats_ack 在读协程里直接收束：上报回路可能正卡在等这一批确认，
+			// 等主循环来消费就永远等不到。
+			if err == nil && msg.T == msgStatsAck {
+				var ack struct {
+					Batch string `json:"batch"`
+				}
+				if json.Unmarshal(msg.D, &ack) == nil {
+					s.resolveStatsAck(ack.Batch)
+				}
+				continue
+			}
 			select {
 			case inbox <- inboxFrame{msg: msg, err: err}:
 			case <-readerCtx.Done():
@@ -258,6 +330,14 @@ func (s *session) serve(ctx context.Context) error {
 			}
 		}
 	}()
+
+	// 读协程就位后再把上一轮还没入账的用量送出，然后要 desired。
+	if err := reportStats(ctx, s); err != nil {
+		logf(levelWarning, "%s", err.Error())
+	}
+	if err := s.requestDesired(ctx); err != nil {
+		return err
+	}
 
 	heartbeat := time.NewTicker(heartbeatInterval)
 	defer heartbeat.Stop()

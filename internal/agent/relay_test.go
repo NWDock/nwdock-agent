@@ -14,8 +14,11 @@ import (
 func resetRelay(dir string) {
 	relayStop()
 	relayEng.mu.Lock()
-	relayEng.ports = map[int]*relayHandle{}
+	relayEng.handles = map[string]*relayHandle{}
 	relayEng.persist = nil
+	relayEng.fwdPersist = nil
+	relayEng.liveForwards = map[string]bool{}
+	relayEng.retiredForwards = map[string]bool{}
 	relayEng.dir = dir
 	relayEng.mu.Unlock()
 }
@@ -253,22 +256,61 @@ func TestRelayPersistsAcrossRestart(t *testing.T) {
 }
 
 func TestRelayStatesCapAndTruncate(t *testing.T) {
-	ports := map[int]*relayHandle{}
+	handles := map[string]*relayHandle{}
 	long := strings.Repeat("x", 1000)
-	for i := 1; i <= 600; i++ {
-		ports[i] = &relayHandle{spec: relaySpec{Port: i}, err: long}
+	for i := 1; i <= 300; i++ {
+		handles[relayPortKey(i)] = &relayHandle{spec: relaySpec{Port: i}, err: long}
+		handles[relayForwardKey(strconv.Itoa(i))] = &relayHandle{spec: relaySpec{Port: i, ForwardID: strconv.Itoa(i)}, err: long}
 	}
-	states := relayStateList(ports)
-	if len(states) != relayMaxStates {
-		t.Fatalf("states %d want %d", len(states), relayMaxStates)
+	all := relayStateList(handles)
+	if len(all) != len(handles) {
+		t.Fatalf("full list %d want %d", len(all), len(handles))
 	}
-	for _, st := range states {
+	// 全表排序：失败段在前，段内按端口与 forward id 升序。
+	for i := 1; i < len(all); i++ {
+		prev, cur := all[i-1], all[i]
+		if (prev.Error == "") != (cur.Error == "") {
+			if prev.Error == "" {
+				t.Fatalf("failed entry after live at %d", i)
+			}
+			continue
+		}
+		if prev.Port > cur.Port {
+			t.Fatalf("port order broken at %d: %+v %+v", i, prev, cur)
+		}
+	}
+	capped := all[:relayMaxStates]
+	legacySeen := false
+	for _, st := range capped {
 		if len(st.Error) > 256 || !utf8.ValidString(st.Error) {
 			t.Fatalf("error not heartbeat-safe: %q", st.Error)
 		}
 		if st.Listening {
 			t.Fatalf("failed port reported listening: %+v", st)
 		}
+		if st.ForwardID == "" {
+			legacySeen = true
+		}
+	}
+	if !legacySeen {
+		t.Fatal("no legacy entries in capped list")
+	}
+}
+
+func TestRelayHeartbeatStateFields(t *testing.T) {
+	handles := map[string]*relayHandle{
+		relayPortKey(80):      {spec: relaySpec{Port: 80}, err: "boom"},
+		relayForwardKey("f1"): {spec: relaySpec{Port: 81, ForwardID: "f1"}},
+	}
+	all := relayStateList(handles)
+	if len(all) != 2 {
+		t.Fatalf("states %+v", all)
+	}
+	if all[0].Port != 80 || all[0].Error != "boom" || all[0].Listening {
+		t.Fatalf("failed entry first: %+v", all[0])
+	}
+	if all[1].ForwardID != "f1" || !all[1].Listening || all[1].Error != "" {
+		t.Fatalf("forward entry: %+v", all[1])
 	}
 }
 

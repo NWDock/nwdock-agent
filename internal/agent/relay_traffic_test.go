@@ -17,6 +17,24 @@ func relayCounterValue(name string) int64 {
 	return relayCounters()[name]
 }
 
+// waitRelayCounter 等到全局转发计数达到期望值：回显字节进内核与计数入账之间
+// 差一个调度节拍，紧跟着回显读的精确断言必须轮询。
+func waitRelayCounter(t *testing.T, name string, want int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := relayCounterValue(name); got == want {
+			return got
+		} else if got > want {
+			t.Fatalf("%s = %d, want exactly %d", name, got, want)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d", name, relayCounterValue(name), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestRelayCountsActualBytes TCP 转发按成功写入计实际字节：客户端写入落地计 uplink，
 // 落地回显计 downlink；半关闭后宽限窗口内不再补计。
 func TestRelayCountsActualBytes(t *testing.T) {
@@ -39,12 +57,10 @@ func TestRelayCountsActualBytes(t *testing.T) {
 	echoThrough(t, conn, payload)
 	echoThrough(t, conn, payload)
 
-	up := relayCounterValue("relay>>>all>>>traffic>>>uplink")
-	down := relayCounterValue("relay>>>all>>>traffic>>>downlink")
-	if up != int64(2*len(payload)) {
+	if up := waitRelayCounter(t, "relay>>>all>>>traffic>>>uplink", int64(2*len(payload))); up != int64(2*len(payload)) {
 		t.Fatalf("uplink %d want %d", up, 2*len(payload))
 	}
-	if down != int64(2*len(payload)) {
+	if down := waitRelayCounter(t, "relay>>>all>>>traffic>>>downlink", int64(2*len(payload))); down != int64(2*len(payload)) {
 		t.Fatalf("downlink %d want %d", down, 2*len(payload))
 	}
 }
@@ -94,10 +110,18 @@ func TestRelayUDPCountsBothDirections(t *testing.T) {
 			t.Fatalf("read %d: %v", i, err)
 		}
 	}
-	up := relayCounterValue("relay>>>all>>>traffic>>>uplink")
-	down := relayCounterValue("relay>>>all>>>traffic>>>downlink")
-	if up < int64(len(payload)) || down < int64(len(payload)) {
-		t.Fatalf("udp counters up=%d down=%d want both >= %d", up, down, len(payload))
+	// 轮询到入账再断言（回显读返回与计数入账差一个调度节拍）。
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		up := relayCounterValue("relay>>>all>>>traffic>>>uplink")
+		down := relayCounterValue("relay>>>all>>>traffic>>>downlink")
+		if up >= int64(len(payload)) && down >= int64(len(payload)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("udp counters up=%d down=%d want both >= %d", up, down, len(payload))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -49,7 +49,37 @@ type desiredBody struct {
 	Geo        []geoDesired     `json:"geo"`
 	RuleSets   []ruleSetDesired `json:"rule_sets"`
 	Relays     []relaySpec      `json:"relays"`
+	Forwards   []forwardDesired `json:"forwards"`
 	LogLevel   string           `json:"log_level"`
+}
+
+// forwardDesired 是 desired.forwards 的单项：面板管理的独立转发，id 全局唯一，
+// 计数按 forward>>><id> 单列。字段名与 panel 侧逐字一致。
+type forwardDesired struct {
+	ID           string `json:"id"`
+	Port         int    `json:"port"`
+	TargetHost   string `json:"target_host"`
+	TargetPort   int    `json:"target_port"`
+	TCP          bool   `json:"tcp"`
+	UDP          bool   `json:"udp"`
+	AllowPrivate bool   `json:"allow_private"`
+}
+
+// forwardSpecs 把独立转发清单折算成 engine 的 relaySpec；id 记进 ForwardID。
+func forwardSpecs(items []forwardDesired) []relaySpec {
+	out := make([]relaySpec, 0, len(items))
+	for _, item := range items {
+		out = append(out, relaySpec{
+			Port:         item.Port,
+			TargetHost:   item.TargetHost,
+			TargetPort:   item.TargetPort,
+			TCP:          item.TCP,
+			UDP:          item.UDP,
+			ForwardID:    item.ID,
+			AllowPrivate: item.AllowPrivate,
+		})
+	}
+	return out
 }
 
 // bootArgs 是 bootWithRollback/restartLocked 需要的一组派生参数。
@@ -262,7 +292,17 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	}
 	// 入口转发与核心完全解耦：清单无条件下发，无论 serving 与核心状态如何都先应用；
 	// 之后核心重启、换核或配置失败都不影响已建立的入口转发。
-	relayApply(s.cfg.DataDir, body.Relays)
+	// forwards 段缺席（旧面板）时只收敛 legacy 清单；显式空数组撤销全部独立转发。
+	// 清单落盘失败直接返回：不确认世代，面板下一轮重推，运行时保持上一份清单。
+	if body.Forwards == nil {
+		if err := relayApply(s.cfg.DataDir, body.Relays); err != nil {
+			return err
+		}
+	} else {
+		if err := relayApplyAll(s.cfg.DataDir, body.Relays, forwardSpecs(body.Forwards)); err != nil {
+			return err
+		}
+	}
 	want := normalizeCore(body.Core)
 	proc.mu.Lock()
 	defer proc.mu.Unlock()

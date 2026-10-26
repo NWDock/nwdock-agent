@@ -911,6 +911,10 @@ func TestChannelMessageShapes(t *testing.T) {
 		if got := req["api"]; got != "127.0.0.1:10085" {
 			t.Fatalf("desired_req %v", req)
 		}
+		feats, ok := req["features"].([]any)
+		if !ok || len(feats) != 1 || feats[0] != "forward-v1" {
+			t.Fatalf("desired_req features %v", req["features"])
+		}
 		beat, ok := seen["heartbeat"]
 		if !ok {
 			t.Fatalf("frames %v", seen)
@@ -919,6 +923,19 @@ func TestChannelMessageShapes(t *testing.T) {
 			if _, ok := beat[key]; !ok {
 				t.Fatalf("heartbeat missing %q: %v", key, beat)
 			}
+		}
+		beatFeats, ok := beat["features"].([]any)
+		if !ok || len(beatFeats) != 1 || beatFeats[0] != "forward-v1" {
+			t.Fatalf("heartbeat features %v", beat["features"])
+		}
+		if _, ok := beat["relay_total"].(float64); !ok {
+			t.Fatalf("heartbeat relay_total %v", beat["relay_total"])
+		}
+		if _, ok := beat["relay_truncated"].(bool); !ok {
+			t.Fatalf("heartbeat relay_truncated %v", beat["relay_truncated"])
+		}
+		if _, ok := beat["relay"].([]any); !ok {
+			t.Fatalf("heartbeat relay %v", beat["relay"])
 		}
 		if _, ok := beat["cert_not_after"]; ok {
 			t.Fatal("cert_not_after must be gone")
