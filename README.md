@@ -27,6 +27,7 @@ cp .env.agent.example .env.agent
 - `AGENT_PANEL_ENDPOINTS`：面板地址，如 `https://panel.example` 或 `http://127.0.0.1:8088`。不用写路径，进程会补成 `/api/agent/channel`。多个地址用逗号分隔。
 - `AGENT_PANEL_KEYPIN`：面板 stdout 里 `panel identity` 的指纹。
 - `AGENT_ENROLL_TOKEN`：只在身份还没绑定的时候需要。登记完成后从环境文件删掉。
+- `AGENT_MEMORY_LIMIT`：本进程软内存上限，缺省 `768MiB`。`off` 关闭。xray 与 sing-box 是外部进程，不受这项管。
 
 身份私钥在数据目录的 `agent-identity.key`（`0600`）。删掉它等于取消登记，下次要新的安装令牌。
 

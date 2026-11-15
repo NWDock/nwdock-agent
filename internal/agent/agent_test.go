@@ -98,6 +98,83 @@ func TestLoadConfigLegacyEnrollToken(t *testing.T) {
 	}
 }
 
+func TestParseMemoryLimit(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int64
+	}{
+		{"", defaultMemoryLimit},
+		{"   ", defaultMemoryLimit},
+		{"768MiB", 768 << 20},
+		{"1GiB", 1 << 30},
+		{"64MiB", minMemoryLimit},
+		{"805306368", 768 << 20},
+		{"805306368B", 768 << 20},
+		{"off", 0},
+		{"OFF", 0},
+	} {
+		got, err := parseMemoryLimit(tc.in)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%q: got %d want %d", tc.in, got, tc.want)
+		}
+	}
+	for _, bad := range []string{"MB", "768MB", "63MiB", "-1", "0", "1KiB", "nope"} {
+		if _, err := parseMemoryLimit(bad); err == nil || !strings.Contains(err.Error(), "AGENT_MEMORY_LIMIT") {
+			t.Fatalf("%q: want AGENT_MEMORY_LIMIT error, got %v", bad, err)
+		}
+	}
+}
+
+func TestShouldReleaseHeap(t *testing.T) {
+	const mib = uint64(1 << 20)
+	for _, tc := range []struct {
+		inuse, idle, released uint64
+		want                  bool
+	}{
+		{600 * mib, 700 * mib, 0, true},
+		{600 * mib, 700 * mib, 600 * mib, false},
+		{600 * mib, 200 * mib, 0, false},
+		{100 * mib, 200 * mib, 80 * mib, false},
+		{0, 0, 0, false},
+		{100 * mib, 50 * mib, 80 * mib, false},
+	} {
+		got := shouldReleaseHeap(tc.inuse, tc.idle, tc.released)
+		if got != tc.want {
+			t.Fatalf("inuse=%d idle=%d released=%d: got %v want %v", tc.inuse, tc.idle, tc.released, got, tc.want)
+		}
+	}
+}
+
+func TestLoadConfigMemoryLimit(t *testing.T) {
+	t.Setenv("AGENT_RUNTIME", "service")
+	t.Setenv("AGENT_DATA_DIR", "/tmp/agent-data")
+	t.Setenv("AGENT_PANEL_ENDPOINTS", "https://panel.example")
+	t.Setenv("AGENT_PANEL_KEYPIN", "abc")
+	t.Setenv("AGENT_MEMORY_LIMIT", "")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MemoryLimit != defaultMemoryLimit {
+		t.Fatal(cfg.MemoryLimit)
+	}
+	t.Setenv("AGENT_MEMORY_LIMIT", "1GiB")
+	cfg, err = LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MemoryLimit != 1<<30 {
+		t.Fatal(cfg.MemoryLimit)
+	}
+	t.Setenv("AGENT_MEMORY_LIMIT", "768MB")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "AGENT_MEMORY_LIMIT") {
+		t.Fatalf("want AGENT_MEMORY_LIMIT error, got %v", err)
+	}
+}
+
 func TestLoadOrCreateIdentityRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	id, err := loadOrCreateIdentity(dir)

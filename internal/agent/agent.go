@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +31,8 @@ type Config struct {
 	XrayBin    string
 	SingboxBin string
 	XrayAPI    string
+	// MemoryLimit 是进程软内存上限，单位字节。0 表示不设，只在显式 off 时出现。
+	MemoryLimit int64
 
 	fromFile   bool
 	noteMihomo bool
@@ -107,6 +113,11 @@ func buildConfig(base string, pick func(primary string, aliases ...string) strin
 		XrayAPI:    pick("AGENT_XRAY_API_ADDR", "XRAY_API_ADDR"),
 		noteMihomo: pick("AGENT_MIHOMO_BIN", "MIHOMO_BIN") != "",
 	}
+	limit, err := parseMemoryLimit(pick("AGENT_MEMORY_LIMIT"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MemoryLimit = limit
 	if cfg.Runtime != "service" && cfg.Runtime != "docker" {
 		return Config{}, errors.New("AGENT_RUNTIME must be service or docker")
 	}
@@ -137,6 +148,84 @@ func buildConfig(base string, pick func(primary string, aliases ...string) strin
 	return cfg, nil
 }
 
+// defaultMemoryLimit 是内嵌核心长跑时的软上限。Go 按 GOGC=100 会把约一倍空闲堆
+// 留在进程里；设上限后 GC 提前跑，空闲堆不再按流量峰值一直留着。
+const defaultMemoryLimit = 768 << 20
+
+// minMemoryLimit 挡住小到会让 GC 持续抢转发的值。
+const minMemoryLimit = 64 << 20
+
+// parseMemoryLimit 解析 AGENT_MEMORY_LIMIT。空字符串用缺省；off 表示不设。
+// 后缀与 GOMEMLIMIT 相同：B、KiB、MiB、GiB、TiB，以及纯字节数。不接受 MB。
+func parseMemoryLimit(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultMemoryLimit, nil
+	}
+	if strings.EqualFold(raw, "off") {
+		return 0, nil
+	}
+	n, ok := parseByteCount(raw)
+	if !ok || n < minMemoryLimit {
+		return 0, fmt.Errorf("AGENT_MEMORY_LIMIT 必须是至少 64MiB 的字节数（如 768MiB），或 off")
+	}
+	return n, nil
+}
+
+// parseByteCount 对齐 runtime.parseByteCount：^[0-9]+(([KMGT]i)?B)?$。
+func parseByteCount(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	last := s[len(s)-1]
+	if last >= '0' && last <= '9' {
+		n, err := strconv.ParseInt(s, 10, 64)
+		return n, err == nil && n >= 0
+	}
+	if last != 'B' || len(s) < 2 {
+		return 0, false
+	}
+	if c := s[len(s)-2]; c >= '0' && c <= '9' {
+		n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
+		return n, err == nil && n >= 0
+	} else if c != 'i' {
+		return 0, false
+	}
+	if len(s) < 4 {
+		return 0, false
+	}
+	power := 0
+	switch s[len(s)-3] {
+	case 'K':
+		power = 1
+	case 'M':
+		power = 2
+	case 'G':
+		power = 3
+	case 'T':
+		power = 4
+	default:
+		return 0, false
+	}
+	m := uint64(1)
+	for i := 0; i < power; i++ {
+		m *= 1024
+	}
+	n, err := strconv.ParseInt(s[:len(s)-3], 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	un := uint64(n)
+	if un > math.MaxUint64/m {
+		return 0, false
+	}
+	un *= m
+	if un > uint64(math.MaxInt64) {
+		return 0, false
+	}
+	return int64(un), true
+}
+
 // scrubAgentEnv drops agent settings from the process environment so a core
 // subprocess started with os.Environ cannot see them.
 func scrubAgentEnv() {
@@ -164,6 +253,7 @@ func scrubAgentEnv() {
 // Run 建立并维持 nwdock-agent-v1 加密通道：desired 推送驱动配置应用，
 // 15s 心跳、60s stats；断开走退避 + jitter + endpoint 轮转重连。
 func Run(ctx context.Context, cfg Config) error {
+	applyMemoryLimit(ctx, cfg.MemoryLimit)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
@@ -212,6 +302,52 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		cfg.Endpoints = append(cfg.Endpoints[1:], cfg.Endpoints[0])
 	}
+}
+
+// heapReleaseEvery 是检查空闲堆的间隔。FreeOSMemory 会触发一次 GC，不能跟心跳走。
+const heapReleaseEvery = 5 * time.Minute
+
+// heapReleaseMin 是值得归还的最小空闲量。小于它就留给运行时自己收。
+const heapReleaseMin = 128 << 20
+
+// applyMemoryLimit 设置进程软内存上限，并周期把多出来的空闲堆还给系统。
+// limit 为 0 表示不设上限，归还仍会做。上限不含栈和堆外内存。
+func applyMemoryLimit(ctx context.Context, limit int64) {
+	if limit > 0 {
+		debug.SetMemoryLimit(limit)
+		logf(levelInfo, "memory limit %dMiB", limit>>20)
+	}
+	go releaseIdleHeap(ctx)
+}
+
+// releaseIdleHeap 在空闲堆明显多过在用堆时归还。流量高峰留下的页否则会一直占着 RSS。
+func releaseIdleHeap(ctx context.Context) {
+	ticker := time.NewTicker(heapReleaseEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			if !shouldReleaseHeap(ms.HeapInuse, ms.HeapIdle, ms.HeapReleased) {
+				continue
+			}
+			debug.FreeOSMemory()
+			logf(levelInfo, "released idle heap")
+		}
+	}
+}
+
+// shouldReleaseHeap 在可归还的空闲堆达到 128MiB 且多于在用堆时返回 true。
+// HeapReleased 已还给系统，不重复计算。
+func shouldReleaseHeap(inuse, idle, released uint64) bool {
+	if idle < released {
+		return false
+	}
+	reclaimable := idle - released
+	return reclaimable >= heapReleaseMin && reclaimable > inuse
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
