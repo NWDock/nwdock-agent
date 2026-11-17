@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/observable"
@@ -21,7 +22,7 @@ import (
 // 交给 meterTunnel 计数；出站、规则和 DNS 仍由 executor.ApplyConfig 更新。
 type embeddedRuntime struct {
 	version   string
-	running   bool
+	running   atomic.Bool
 	listeners map[string]C.InboundListener
 	logSub    observable.Subscription[mihomolog.Event]
 }
@@ -42,12 +43,15 @@ func (e *embeddedRuntime) Version() string {
 	return e.version
 }
 
-func (e *embeddedRuntime) Running() bool { return e.running }
+func (e *embeddedRuntime) Running() bool { return e.running.Load() }
 
 func (e *embeddedRuntime) Test(_ context.Context, configPath, dir string) error {
 	C.SetHomeDir(dir)
-	_, err := parseMihomoFile(configPath)
-	return err
+	cfg, err := parseMihomoFile(configPath)
+	if err != nil {
+		return err
+	}
+	return cfg.Close()
 }
 
 func (e *embeddedRuntime) Start(ctx context.Context, configPath, dir string) error {
@@ -104,10 +108,16 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 		}
 		if old != nil {
 			traffic.closeInbound(name)
-			_ = old.Close()
+			closeInboundListener(old)
+			delete(e.listeners, name)
 		}
 		if err := lis.Listen(meterTunnel{}); err != nil {
-			_ = lis.Close()
+			closeInboundListener(lis)
+			for n, opened := range next {
+				if opened != e.listeners[n] {
+					closeInboundListener(opened)
+				}
+			}
 			return fmt.Errorf("listen %s: %w", name, err)
 		}
 		next[name] = lis
@@ -117,10 +127,10 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 			continue
 		}
 		traffic.closeInbound(name)
-		_ = old.Close()
+		closeInboundListener(old)
 	}
 	e.listeners = next
-	e.running = true
+	e.running.Store(true)
 	e.version = C.Version
 	return nil
 }
@@ -132,14 +142,22 @@ func (e *embeddedRuntime) Stop() {
 	}
 	for name, lis := range e.listeners {
 		traffic.closeInbound(name)
-		_ = lis.Close()
+		closeInboundListener(lis)
 	}
 	e.listeners = map[string]C.InboundListener{}
 	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
 		_ = c.Close()
 		return true
 	})
-	e.running = false
+	e.running.Store(false)
+}
+
+func closeInboundListener(lis C.InboundListener) {
+	if lis == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	_ = lis.Close()
 }
 
 func (e *embeddedRuntime) Counters(context.Context) (map[string]int64, error) {

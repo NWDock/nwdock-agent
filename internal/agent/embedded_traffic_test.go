@@ -8,7 +8,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -307,4 +309,132 @@ func waitSink(t *testing.T, sunk *atomic.Int64, want int64) {
 
 func resetTraffic() {
 	traffic = newTrafficMeter()
+}
+
+func TestEmbeddedTestClosesResourcesAndRunningRaceFree(t *testing.T) {
+	dir := t.TempDir()
+	port := freePort(t)
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-test
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+proxies:
+  - name: out-1
+    type: nowhere
+    server: 127.0.0.1
+    port: %d
+    password: %s
+    skip-cert-verify: true
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [out-1]
+    url: http://127.0.0.1:1/generate_204
+    interval: 1
+rules:
+  - MATCH,auto
+`, port, trafficTestPassword, port, trafficTestPassword)
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newEmbeddedRuntime()
+	// 先做一轮预热，再检查多次 Test 不会持续堆积后台健康检查协程。
+	if err := rt.Test(context.Background(), path, dir); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	baseG := runtime.NumGoroutine()
+	for range 20 {
+		if err := rt.Test(context.Background(), path, dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if leaked := runtime.NumGoroutine() - baseG; leaked > 10 {
+		t.Fatalf("embedded Test leaked goroutines: before=%d after=%d", baseG, baseG+leaked)
+	}
+
+	// 并发读写 Running() 与 Start/Stop（-race 下验证 atomic.Bool 无竞态）。
+	simplePath := filepath.Join(dir, "simple.yaml")
+	if err := os.WriteFile(simplePath, []byte("log-level: silent\nfind-process-mode: \"off\"\nrules:\n  - MATCH,DIRECT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopPoll := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			default:
+				_ = rt.Running()
+			}
+		}
+	}()
+	if err := rt.Start(context.Background(), simplePath, dir); err != nil {
+		close(stopPoll)
+		wg.Wait()
+		t.Fatal(err)
+	}
+	if !rt.Running() {
+		rt.Stop()
+		close(stopPoll)
+		wg.Wait()
+		t.Fatal("expected Running() == true after Start")
+	}
+	rt.Stop()
+	close(stopPoll)
+	wg.Wait()
+	if rt.Running() {
+		t.Fatal("expected Running() == false after Stop")
+	}
+}
+
+func TestEmbeddedApplyPartialFailureDropsClosedListener(t *testing.T) {
+	dir := t.TempDir()
+	portA := freePort(t)
+	busyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busyLn.Close()
+	busyPort := busyLn.Addr().(*net.TCPAddr).Port
+
+	writeCfg := func(name string, port int) string {
+		p := filepath.Join(dir, name)
+		body := fmt.Sprintf("log-level: silent\nfind-process-mode: \"off\"\nlisteners:\n  - name: lis-a\n    type: socks\n    listen: 127.0.0.1\n    port: %d\nrules:\n  - MATCH,DIRECT\n", port)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cfgGood := writeCfg("good.yaml", portA)
+	cfgConflict := writeCfg("conflict.yaml", busyPort)
+
+	rt := newEmbeddedRuntime()
+	defer rt.Stop()
+	if err := rt.Start(context.Background(), cfgGood, dir); err != nil {
+		t.Fatal(err)
+	}
+	// Apply 改到已被占用的端口：旧 lis-a 先关、新 lis-a Listen 失败。
+	if err := rt.Apply(context.Background(), cfgConflict, dir, nil, "", nil, false, false); err == nil {
+		t.Fatal("expected Apply to fail on occupied port")
+	}
+	// 随后直接 Apply 回原配置：不得把已关闭的旧 lis-a 当存活句柄复用，portA 必须重新监听成功。
+	if err := rt.Apply(context.Background(), cfgGood, dir, nil, "", nil, false, false); err != nil {
+		t.Fatalf("recovery Apply failed: %v", err)
+	}
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", portA), 2*time.Second)
+	if err != nil {
+		t.Fatalf("portA should be listening after recovery Apply, dial failed: %v", err)
+	}
+	_ = c.Close()
 }

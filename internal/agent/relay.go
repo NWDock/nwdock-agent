@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,7 @@ const (
 	relayUDPIdle        = 60 * time.Second
 	relayUDPSweep       = 10 * time.Second
 	relayUDPSessions    = 4096
+	relayUDPPendingMax  = 256
 	relayUDPBuffer      = 64 << 10
 	relayWantFile       = "relay-want.json"
 	// forwardCounterPrefix 是独立转发计数键的固定前缀：forward>>><id>>>traffic>>><方向>。
@@ -82,6 +84,7 @@ type relayUDP struct {
 	pc       net.PacketConn
 	mu       sync.Mutex
 	sessions map[string]*relayUDPSession
+	pending  map[string]struct{}
 	closed   bool
 	done     chan struct{}
 	fwd      string
@@ -217,7 +220,8 @@ var relayEng = &relayEngine{
 }
 
 // retireConfirmedForwards 退休「已撤销且面板已确认收到最后一笔」的转发计数。
-// 只在 stats_ack 之后调用：没确认就删条目，删除前那段字节会永久丢失。
+// 只在 stats_ack 之后调用：没确认就删条目，删除前那段字节会永久丢失；
+// 若快照之后又有尾量写入，或转发在 ack 前被重新启用，都不删除计数。
 func retireConfirmedForwards(counters map[string]int64) {
 	if len(counters) == 0 {
 		return
@@ -234,8 +238,20 @@ func retireConfirmedForwards(counters map[string]int64) {
 	relayEng.mu.Lock()
 	defer relayEng.mu.Unlock()
 	for id := range ids {
+		if relayEng.liveForwards[id] {
+			delete(relayEng.retiredForwards, id)
+			continue
+		}
 		if !relayEng.retiredForwards[id] {
 			continue
+		}
+		if v, ok := forwardBytes.Load(id); ok {
+			t := v.(*relayTraffic)
+			wantUp := counters[forwardCounterPrefix+id+">>>traffic>>>uplink"]
+			wantDown := counters[forwardCounterPrefix+id+">>>traffic>>>downlink"]
+			if t.up.Load() != wantUp || t.down.Load() != wantDown {
+				continue
+			}
 		}
 		delete(relayEng.retiredForwards, id)
 		forwardBytes.Delete(id)
@@ -291,29 +307,102 @@ func (sp relaySpec) target() string {
 	return net.JoinHostPort(sp.TargetHost, strconv.Itoa(sp.TargetPort))
 }
 
-// dial 按清单拨号到落地。独立转发在 allow_private=false 时对解析出的每个地址做
-// 非公网校验（防 DNS 重绑定）；legacy 一律不校验。
+// testRelayDial 仅供单测注入慢速拨号；生产路径恒为 nil。
+var testRelayDial func(sp relaySpec, ctx context.Context, network, addr string) (net.Conn, error)
+
+// dial 按清单拨号到落地。所有条目一律阻断拨回本机同监听端口的自环；
+// 独立转发在 allow_private=false 时另对解析出的每个地址做公网与非本机接口校验（防 DNS 重绑定与本机反射）。
 func (sp relaySpec) dial(network, addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: relayDialTimeout}
-	if sp.ForwardID != "" && !sp.AllowPrivate {
-		d.Control = func(_, address string, _ syscall.RawConn) error {
-			return checkPublicTarget(sp.ForwardID, address)
-		}
-	}
-	return d.Dial(network, addr)
+	return sp.dialContext(context.Background(), network, addr)
 }
 
-// checkPublicTarget 校验拨号地址是公网 IP；在解析后、连接前逐地址调用，
-// 域名重绑定到私网地址时拨号直接失败。
-func checkPublicTarget(id, address string) error {
-	host, _, err := net.SplitHostPort(address)
+func (sp relaySpec) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if hook := testRelayDial; hook != nil {
+		return hook(sp, ctx, network, addr)
+	}
+	d := &net.Dialer{
+		Timeout: relayDialTimeout,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			return sp.checkDialTarget(address)
+		},
+	}
+	return d.DialContext(ctx, network, addr)
+}
+
+func (sp relaySpec) checkDialTarget(address string) error {
+	host, port, err := parseDialTarget(address)
 	if err != nil {
 		return err
 	}
-	if forwardIPBlocked(net.ParseIP(host)) {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("invalid target ip %q", host)
+	}
+	local := isLocalInterfaceIP(ip)
+	if local && port == sp.Port {
+		return fmt.Errorf("relay %d: target %s:%d loops back to listen port", sp.Port, host, port)
+	}
+	if sp.ForwardID != "" && !sp.AllowPrivate {
+		if forwardIPBlocked(ip) || local {
+			return fmt.Errorf("forward %s: target %s is not public", sp.ForwardID, host)
+		}
+	}
+	return nil
+}
+
+// checkPublicTarget 校验拨号地址是公网且非本机接口 IP；在解析后、连接前逐地址调用，
+// 域名重绑定到私网或本机公网地址时拨号直接失败。
+func checkPublicTarget(id, address string) error {
+	host, _, err := parseDialTarget(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if forwardIPBlocked(ip) || isLocalInterfaceIP(ip) {
 		return fmt.Errorf("forward %s: target %s is not public", id, host)
 	}
 	return nil
+}
+
+func parseDialTarget(address string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", 0, err
+	}
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, port, nil
+}
+
+func isLocalInterfaceIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var local net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			local = v.IP
+		case *net.IPAddr:
+			local = v.IP
+		}
+		if local != nil && local.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 var forwardReservedV4 = mustIPBlocks(
@@ -334,12 +423,18 @@ var forwardReservedV4 = mustIPBlocks(
 )
 
 var forwardReservedV6 = mustIPBlocks(
-	"::/128",        // unspecified
-	"::1/128",       // loopback
-	"fe80::/10",     // link-local
-	"fc00::/7",      // ULA 私网
-	"ff00::/8",      // 组播
-	"2001:db8::/32", // 文档示例段
+	"::/128",          // unspecified
+	"::1/128",         // loopback
+	"::ffff:0:0/96",   // IPv4 映射过渡段
+	"::ffff:0:0:0/96", // SIIT IPv4 转换过渡段
+	"64:ff9b::/96",    // NAT64 公认前缀
+	"64:ff9b:1::/48",  // NAT64 本地前缀
+	"100::/64",        // 丢弃段（RFC 6666）
+	"2001:db8::/32",   // 文档示例段
+	"2002::/16",       // 6to4 过渡段
+	"fe80::/10",       // link-local
+	"fc00::/7",        // ULA 私网
+	"ff00::/8",        // 组播
 )
 
 func mustIPBlocks(cidrs ...string) []*net.IPNet {
@@ -511,25 +606,27 @@ func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) error {
 		if !sp.validForward() {
 			continue
 		}
-		if _, dup := want[sp.ForwardID]; dup {
+		key := relayForwardKey(sp.ForwardID)
+		if _, dup := want[key]; dup {
 			continue
 		}
-		want[relayForwardKey(sp.ForwardID)] = sp
+		want[key] = sp
 	}
 	// 先落盘再切运行时：落盘失败时运行中的清单不动，调用方不确认世代。
 	if err := e.persistWantLocked(&e.fwdPersist, want, writeForwardWant); err != nil {
 		return err
 	}
 	// 本批消失的 id 进退休队列：累计计数保留到面板 stats_ack 确认后才丢，
-	// 否则删除前最后一笔字节会随条目一起蒸发。
+	// 否则删除前最后一笔字节会随条目一起蒸发。重新启用的 id 从退休队列摘除。
 	for id := range e.liveForwards {
 		if _, ok := want[relayForwardKey(id)]; !ok {
 			e.retiredForwards[id] = true
 		}
 	}
 	e.liveForwards = make(map[string]bool, len(want))
-	for key := range want {
-		e.liveForwards[key[len(relayForwardKey("")):]] = true
+	for _, sp := range want {
+		e.liveForwards[sp.ForwardID] = true
+		delete(e.retiredForwards, sp.ForwardID)
 	}
 	e.reconcileLocked(true, want)
 	return nil
@@ -554,14 +651,23 @@ func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relayS
 		if ok && h.err == "" && h.spec == sp {
 			continue // 无变化：监听器与已建立的连接都保持
 		}
+		keep := false
 		if ok {
 			// 同键存在：仅换目标或只动 UDP 开关时保留已建立的 TCP 会话，新连接走新目标；
 			// TCP 开关变化、或 allow_private 被收紧（放开→收紧）都必须断掉旧会话，
 			// 否则已放行的内网连接会留在收紧后的策略外。
-			keep := sp.TCP && h.spec.TCP && !(h.spec.AllowPrivate && !sp.AllowPrivate)
+			keep = sp.TCP && h.spec.TCP && !(h.spec.AllowPrivate && !sp.AllowPrivate)
 			e.closeHandleLocked(h, keep)
 		}
-		e.handles[key] = e.openLocked(sp)
+		nh := e.openLocked(sp)
+		if keep {
+			for s := range h.sessions {
+				s.h = nh
+				nh.sessions[s] = struct{}{}
+			}
+			h.sessions = nil
+		}
+		e.handles[key] = nh
 	}
 }
 
@@ -646,6 +752,16 @@ func (e *relayEngine) serveTCP(ln net.Listener, h *relayHandle) {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 // relayPipeTCP 原样转发一条 TCP 连接，双向拷贝到落地入站端口；按成功写入计实际字节。
 // 计数的 forward id 取自 handle 规格，端口复用或目标变化都不串账。
 func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
@@ -666,10 +782,12 @@ func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
 	fwd := h.spec.ForwardID
 	go func() {
 		_, _ = io.Copy(relayCountingWriter{dst: up, upload: true, fwd: fwd}, client)
+		closeWrite(up)
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = io.Copy(relayCountingWriter{dst: client, upload: false, fwd: fwd}, up)
+		closeWrite(client)
 		done <- struct{}{}
 	}()
 	<-done
@@ -692,17 +810,13 @@ func (e *relayEngine) serveUDP(t *relayUDP, sp relaySpec) {
 			continue
 		}
 		key := addr.String()
-		s, ok := t.lookup(key)
-		if !ok {
-			up, derr := sp.dial("udp", target)
-			if derr != nil {
-				continue
+		s, startDial := t.lookupOrStartDial(key)
+		if s == nil {
+			if startDial {
+				pkt := append([]byte(nil), buf[:n]...)
+				go t.dialAndSend(sp, target, key, addr, pkt)
 			}
-			if s = t.add(key, up); s == nil {
-				_ = up.Close()
-				continue
-			}
-			go t.pumpBack(s, addr)
+			continue
 		}
 		s.last.Store(time.Now().UnixNano())
 		written, werr := s.up.Write(buf[:n])
@@ -715,11 +829,82 @@ func (e *relayEngine) serveUDP(t *relayUDP, sp relaySpec) {
 	}
 }
 
-func (t *relayUDP) lookup(key string) (*relayUDPSession, bool) {
+func (t *relayUDP) lookupOrStartDial(key string) (*relayUDPSession, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	s, ok := t.sessions[key]
-	return s, ok
+	if s, ok := t.sessions[key]; ok {
+		return s, false
+	}
+	if t.closed {
+		return nil, false
+	}
+	if t.pending == nil {
+		t.pending = map[string]struct{}{}
+	}
+	if _, inflight := t.pending[key]; inflight || len(t.pending) >= relayUDPPendingMax {
+		return nil, false
+	}
+	t.pending[key] = struct{}{}
+	return nil, true
+}
+
+func (t *relayUDP) clearPending(key string) {
+	t.mu.Lock()
+	delete(t.pending, key)
+	t.mu.Unlock()
+}
+
+func (t *relayUDP) finishDial(key string, up net.Conn) *relayUDPSession {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.pending, key)
+	if t.closed {
+		return nil
+	}
+	if s, ok := t.sessions[key]; ok {
+		return s
+	}
+	if len(t.sessions) >= relayUDPSessions {
+		t.evictOldestLocked()
+	}
+	s := &relayUDPSession{up: up}
+	s.last.Store(time.Now().UnixNano())
+	t.sessions[key] = s
+	return s
+}
+
+func (t *relayUDP) dialAndSend(sp relaySpec, target, key string, addr net.Addr, pkt []byte) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if t.done != nil {
+		go func() {
+			select {
+			case <-t.done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	up, derr := sp.dialContext(ctx, "udp", target)
+	cancel()
+	if derr != nil {
+		t.clearPending(key)
+		return
+	}
+	s := t.finishDial(key, up)
+	if s == nil || s.up != up {
+		_ = up.Close()
+		return
+	}
+	s.last.Store(time.Now().UnixNano())
+	written, werr := s.up.Write(pkt)
+	if written > 0 {
+		relayNoteTo(t.fwd, int64(written), true)
+	}
+	if werr != nil {
+		t.drop(key, s)
+		return
+	}
+	t.pumpBack(s, addr)
 }
 
 func (t *relayUDP) add(key string, up net.Conn) *relayUDPSession {
@@ -825,7 +1010,10 @@ func (t *relayUDP) close() {
 		return
 	}
 	t.closed = true
-	close(t.done)
+	if t.done != nil {
+		close(t.done)
+	}
+	clear(t.pending)
 	sessions := make([]*relayUDPSession, 0, len(t.sessions))
 	for key, s := range t.sessions {
 		sessions = append(sessions, s)

@@ -191,6 +191,7 @@ func waitNoRelayPort(t *testing.T, port int) {
 // 无核心（counters 为 nil）时也能独立上报。
 func TestMergeRelayCounters(t *testing.T) {
 	resetRelayBytes()
+	resetForwardBytes()
 	if got := mergeRelayCounters(nil); len(got) != 0 {
 		t.Fatalf("empty relay counters should pass through: %+v", got)
 	}

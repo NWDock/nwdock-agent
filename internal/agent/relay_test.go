@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"context"
 	"io"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -384,5 +386,185 @@ func TestRelaySpecValidation(t *testing.T) {
 	}
 	if len(raw) != 1 || raw[0].Port != 40000 || !raw[0].TCP {
 		t.Fatalf("persisted %+v", raw)
+	}
+}
+
+func TestRelayTCPHalfClosePropagated(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	t.Cleanup(relayStop)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := io.ReadAll(conn)
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("ack:" + string(req)))
+		if cw, ok := conn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}()
+
+	entry := freePort(t)
+	sinkPort := ln.Addr().(*net.TCPAddr).Port
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sinkPort, TCP: true}})
+	waitRelayListening(t, entry)
+
+	start := time.Now()
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte("half-close-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read after half-close: %v", err)
+	}
+	if string(resp) != "ack:half-close-payload" {
+		t.Fatalf("resp %q", resp)
+	}
+	if elapsed := time.Since(start); elapsed >= 3*time.Second {
+		t.Fatalf("half-close waited too long: %v", elapsed)
+	}
+}
+
+func TestRelayCarriedOverTCPSessionsClosedOnDeleteOrStop(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	t.Cleanup(relayStop)
+
+	sinkA := echoSink(t)
+	sinkB := echoSink(t)
+	sinkC := echoSink(t)
+	entry := freePort(t)
+
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sinkA, TCP: true}})
+	waitRelayListening(t, entry)
+
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	echoThrough(t, conn, "gen1")
+
+	// 连续两次热更新目标后撤销条目：迁移过来的旧 TCP 会话必须被立即关闭，不许变成孤儿连接。
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sinkB, TCP: true}})
+	waitRelayListening(t, entry)
+	echoThrough(t, conn, "gen2")
+
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sinkC, TCP: true}})
+	waitRelayListening(t, entry)
+	echoThrough(t, conn, "gen3")
+
+	relayEng.apply(nil)
+	waitConnClosed(t, conn)
+}
+
+func TestRelayNonBlockingUDPDialAndPendingCap(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	t.Cleanup(relayStop)
+
+	sink := udpEchoSink(t)
+	entry := freeUDPPort(t)
+
+	var dialCount atomic.Int32
+	slowEntered := make(chan struct{})
+	unblockSlow := make(chan struct{})
+	testRelayDial = func(_ relaySpec, ctx context.Context, network, addr string) (net.Conn, error) {
+		if dialCount.Add(1) == 1 {
+			close(slowEntered)
+			select {
+			case <-unblockSlow:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	t.Cleanup(func() { testRelayDial = nil })
+
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sink, UDP: true}})
+	waitRelayListening(t, entry)
+
+	slowClient, err := net.Dial("udp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = slowClient.Close() })
+	if _, err := slowClient.Write([]byte("slow-init")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-slowEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow dial did not start")
+	}
+
+	// 第一个会话拨号仍卡住时，第二个客户端的收发不被 ReadFrom 阻塞。
+	fastClient, err := net.Dial("udp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fastClient.Close() })
+	_ = fastClient.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := fastClient.Write([]byte("fast-ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := fastClient.Read(buf)
+	if err != nil {
+		t.Fatalf("fast client blocked by slow dial: %v", err)
+	}
+	if string(buf[:n]) != "fast-ping" {
+		t.Fatalf("fast echo %q", buf[:n])
+	}
+
+	// 放行慢拨号后，其首包仍能正常转发并回显。
+	close(unblockSlow)
+	_ = slowClient.SetDeadline(time.Now().Add(2 * time.Second))
+	n, err = slowClient.Read(buf)
+	if err != nil {
+		t.Fatalf("slow client initial packet lost: %v", err)
+	}
+	if string(buf[:n]) != "slow-init" {
+		t.Fatalf("slow echo %q", buf[:n])
+	}
+
+	// 并发挂起拨号上限与同源去重校验。
+	tbl := &relayUDP{sessions: map[string]*relayUDPSession{}}
+	if _, start := tbl.lookupOrStartDial("dup"); !start {
+		t.Fatal("first pending dial should start")
+	}
+	if _, start := tbl.lookupOrStartDial("dup"); start {
+		t.Fatal("duplicate pending key should not start second dial")
+	}
+	tbl.clearPending("dup")
+	for i := range relayUDPPendingMax {
+		if _, start := tbl.lookupOrStartDial("p-" + strconv.Itoa(i)); !start {
+			t.Fatalf("pending slot %d rejected", i)
+		}
+	}
+	if _, start := tbl.lookupOrStartDial("overflow"); start {
+		t.Fatal("pending dial cap exceeded")
 	}
 }

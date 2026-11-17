@@ -24,7 +24,6 @@ ENV AGENT_RUNTIME=docker \
     XRAY_BIN=/usr/local/bin/xray \
     XRAY_API_ADDR=127.0.0.1:10085 \
     SINGBOX_BIN=/usr/local/bin/sing-box
-VOLUME ["/var/lib/nowhere-agent"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 FROM base AS xray

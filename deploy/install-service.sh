@@ -75,10 +75,11 @@ valid_endpoint() {
   esac
   port=
   case "$rest" in
-    \[*\):*)
+    \[*\]:*)
       host=${rest#\[}
+      port=${host#*\]:}
       host=${host%%\]:*}
-      port=${rest##*:}
+      [ -n "$port" ] || return 1
       case "$host" in
         ""|*[!0-9a-fA-F:.]*) return 1 ;;
       esac
@@ -93,6 +94,7 @@ valid_endpoint() {
     *:*)
       host=${rest%:*}
       port=${rest##*:}
+      [ -n "$port" ] || return 1
       case "$host" in
         ""|*[!A-Za-z0-9._-]*) return 1 ;;
       esac
@@ -115,7 +117,7 @@ valid_endpoint() {
       p=${p#0}
     done
     [ -n "$p" ] || p=0
-    if [ "$p" -gt 65535 ]; then
+    if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
       return 1
     fi
   fi
@@ -298,11 +300,17 @@ detect_init() {
 }
 
 enable_openrc() {
+  local was_running=0
+  if rc-service nwd-agent status >/dev/null 2>&1; then
+    was_running=1
+  fi
   install -m 0755 "$initd" /etc/init.d/nwd-agent
   if ! rc-update show default 2>/dev/null | grep -q nwd-agent; then
     rc-update add nwd-agent default
   fi
-  if ! rc-service nwd-agent status >/dev/null 2>&1; then
+  if [ "$was_running" -eq 1 ]; then
+    rc-service nwd-agent restart
+  else
     rc-service nwd-agent start
   fi
 }
@@ -527,6 +535,12 @@ load_install_spec() {
     require AGENT_CORE "${AGENT_CORE:-}"
     return 0
   fi
+  if [ "$token" = "-" ]; then
+    if ! IFS= read -r token && [ -z "$token" ]; then
+      token=""
+    fi
+    token=${token%"$cr"}
+  fi
   valid_endpoint "$endpoint" || die "AGENT_PANEL_ENDPOINTS 必须是 http(s)://主机[:端口]"
   valid_hex64 "$token" || die "AGENT_ENROLL_TOKEN 必须是 64 位十六进制"
   command -v curl >/dev/null 2>&1 || die "需要 curl"
@@ -674,6 +688,11 @@ depend() {
 INITD
 chmod 0644 "$initd"
 
+extra_conf=""
+if [ -f "$conf_file" ]; then
+  extra_conf=$(grep -Ev '^[[:space:]]*(AGENT_RUNTIME|AGENT_DATA_DIR|AGENT_PANEL_ENDPOINTS|AGENT_PANEL_KEYPIN|AGENT_ENROLL_TOKEN|AGENT_XRAY_BIN|AGENT_XRAY_API_ADDR|AGENT_SINGBOX_BIN)=' "$conf_file" || true)
+fi
+
 umask 077
 {
   printf 'AGENT_RUNTIME=service\n'
@@ -687,6 +706,9 @@ umask 077
   elif [ "$AGENT_CORE" = singbox ]; then
     printf 'AGENT_SINGBOX_BIN=/opt/nwd-agent/bin/sing-box\n'
   fi
+  if [ -n "$extra_conf" ]; then
+    printf '%s\n' "$extra_conf"
+  fi
 } >"$conf_file"
 chmod 0600 "$conf_file"
 
@@ -694,8 +716,17 @@ if [ -z "$prefix" ]; then
   init=$(detect_init)
   case "$init" in
     systemd)
+      was_active=0
+      if systemctl is-active --quiet nwd-agent; then
+        was_active=1
+      fi
       systemctl daemon-reload
-      systemctl enable --now /opt/nwd-agent/nwd-agent.service
+      if [ "$was_active" -eq 1 ]; then
+        systemctl enable /opt/nwd-agent/nwd-agent.service
+        systemctl restart nwd-agent
+      else
+        systemctl enable --now /opt/nwd-agent/nwd-agent.service
+      fi
       ;;
     openrc)
       enable_openrc

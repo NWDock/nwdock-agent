@@ -55,6 +55,7 @@ func submitStats(ctx context.Context, s *session, counters map[string]int64) err
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	ackedCounters := make(map[string]int64, len(counters))
 	for start := 0; start < len(names); start += statsBatchKeys {
 		end := start + statsBatchKeys
 		if end > len(names) {
@@ -70,7 +71,10 @@ func submitStats(ctx context.Context, s *session, counters map[string]int64) err
 		}
 		// 只有面板确认过的批次才触发退休：没确认就删，撤销前最后一笔字节会丢。
 		if acked {
-			retireConfirmedForwards(batch)
+			for k, v := range batch {
+				ackedCounters[k] = v
+			}
+			retireConfirmedForwards(ackedCounters)
 		}
 	}
 	return nil
@@ -105,21 +109,29 @@ func submitStatsBatch(ctx context.Context, s *session, batch map[string]int64) (
 var statsBatchSeq uint64
 
 func reportStats(ctx context.Context, s *session) error {
-	core, _ := runningCoreInfo()
-	return reportCounters(ctx, s, core)
+	proc.mu.Lock()
+	var rt coreRuntime
+	var core coreKind
+	if proc.rt != nil && proc.rt.Running() {
+		rt = proc.rt
+		core = rt.Kind()
+	}
+	proc.mu.Unlock()
+	return reportCounters(ctx, s, rt, core)
 }
 
 // reportStatsLocked 供已持 proc.mu 的 applyDesired/restartLocked 使用；Go 锁不可重入。
 func reportStatsLocked(ctx context.Context, s *session) error {
-	return reportCounters(ctx, s, proc.core)
-}
-
-func reportCounters(ctx context.Context, s *session, core coreKind) error {
 	var rt coreRuntime
+	core := proc.core
 	if proc.rt != nil && proc.rt.Running() && (core == "" || proc.rt.Kind() == core) {
 		rt = proc.rt
 		core = rt.Kind()
 	}
+	return reportCounters(ctx, s, rt, core)
+}
+
+func reportCounters(ctx context.Context, s *session, rt coreRuntime, core coreKind) error {
 	var counters map[string]int64
 	var err error
 	switch {

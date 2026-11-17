@@ -188,6 +188,7 @@ func TestForwardIPBlocklist(t *testing.T) {
 		"198.18.0.1", "198.19.255.255", // 基准测试
 		"224.0.0.1", "240.0.0.1", "255.255.255.255", // 组播/保留/广播
 		"::", "::1", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "2001:db8::10",
+		"64:ff9b::1", "64:ff9b::7f00:1", "64:ff9b:1::1", "::ffff:0:127.0.0.1", "2002:7f00:1::1", "100::1",
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4 映射按 IPv4 判断
 	} {
 		if !forwardIPBlocked(net.ParseIP(ip)) {
@@ -1124,4 +1125,168 @@ func TestForwardStatsAckGatesRetirement(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func TestForwardSelfLoopAndLocalInterfaceBlocked(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	t.Cleanup(relayStop)
+
+	// allow_private=true 也不允许把入口端口拨回自身同端口（防自放大死循环）。
+	entry := freePort(t)
+	selfLoop := fwdSpec("floop", entry, entry, true, false, true)
+	if err := relayApplyAll(dir, nil, []relaySpec{selfLoop}); err != nil {
+		t.Fatal(err)
+	}
+	waitForwardListening(t, "floop")
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	waitConnClosed(t, conn)
+
+	// legacy 同端口自环同样阻断。
+	legacyPort := freePort(t)
+	if err := relayApplyAll(dir, []relaySpec{{Port: legacyPort, TargetHost: "127.0.0.1", TargetPort: legacyPort, TCP: true}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitRelayListening(t, legacyPort)
+	conn2, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(legacyPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn2.Close() })
+	waitConnClosed(t, conn2)
+
+	// 本机网卡上的任意地址在 allow_private=false 下都必须被拦下，防公网地址反射访问本机 0.0.0.0 端口。
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP == nil || ipNet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		addr := net.JoinHostPort(ipNet.IP.String(), "443")
+		if err := checkPublicTarget("f1", addr); err == nil {
+			t.Fatalf("local interface IP %s must be blocked when allow_private=false", ipNet.IP)
+		}
+		samePort := net.JoinHostPort(ipNet.IP.String(), "18080")
+		sp := relaySpec{ForwardID: "f1", Port: 18080, TargetPort: 18080, TCP: true, AllowPrivate: true}
+		if err := sp.checkDialTarget(samePort); err == nil {
+			t.Fatalf("self-loop on local interface IP %s must be blocked", ipNet.IP)
+		}
+	}
+}
+
+func TestForwardDuplicateIDAndResurrectionBeforeAck(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	resetRelayBytes()
+	resetForwardBytes()
+	t.Cleanup(func() {
+		relayStop()
+		resetForwardBytes()
+	})
+
+	sinkA := echoSink(t)
+	sinkB := echoSink(t)
+	p1 := freePort(t)
+	p2 := freePort(t)
+
+	// 同批重复 forward_id 只保留第一条。
+	if err := relayApplyAll(dir, nil, []relaySpec{
+		fwdSpec("fdup", p1, sinkA, true, false, true),
+		fwdSpec("fdup", p2, sinkB, true, false, true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, ok := forwardStateByID("fdup")
+	if !ok || st.Port != p1 {
+		t.Fatalf("duplicate forward_id did not keep first spec: ok=%v %+v", ok, st)
+	}
+
+	// 禁用后在 stats_ack 到达前重新启用：旧批次 ack 不能清空正在运行的累计计数。
+	relayNoteTo("fdup", 80, true)
+	if err := relayApplyAll(dir, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("fdup", p1, sinkA, true, false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	retireConfirmedForwards(map[string]int64{"forward>>>fdup>>>traffic>>>uplink": 80})
+	if got := fwdCounter("fdup", "uplink"); got != 80 {
+		t.Fatalf("resurrected forward counter wiped on ack: %d", got)
+	}
+}
+
+func TestForwardRetirePreservesTailBytesAfterSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	resetRelayBytes()
+	resetForwardBytes()
+	t.Cleanup(relayStop)
+
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("ftail", freePort(t), 1, true, false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	relayNoteTo("ftail", 40, true)
+	if err := relayApplyAll(dir, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// 快照上报 40 后、stats_ack 到达前又有 15 字节尾量入账：本次 ack 不能删计数，也不丢退休标记。
+	relayNoteTo("ftail", 15, true)
+	retireConfirmedForwards(map[string]int64{"forward>>>ftail>>>traffic>>>uplink": 40})
+	if got := fwdCounter("ftail", "uplink"); got != 55 {
+		t.Fatalf("tail bytes lost on stale snapshot ack: got %d want 55", got)
+	}
+
+	// 下一轮上报 55 并被确认后，计数与水位一致，正式退休。
+	retireConfirmedForwards(map[string]int64{"forward>>>ftail>>>traffic>>>uplink": 55})
+	if got := fwdCounter("ftail", "uplink"); got != 0 {
+		t.Fatalf("counter did not retire once tail bytes acked: %d", got)
+	}
+}
+
+func TestForwardCarriedOverSessionClosedOnTightenAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	resetRelayBytes()
+	resetForwardBytes()
+	t.Cleanup(func() {
+		relayStop()
+		resetForwardBytes()
+	})
+
+	sinkA := echoSink(t)
+	sinkB := echoSink(t)
+	entry := freePort(t)
+
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("fhot", entry, sinkA, true, false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	waitForwardListening(t, "fhot")
+
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	echoThrough(t, conn, "before-hot")
+
+	// 热更新落地目标：旧连接保留并迁移到新 handle。
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("fhot", entry, sinkB, true, false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	waitForwardListening(t, "fhot")
+	echoThrough(t, conn, "after-hot")
+
+	// 收紧 allow_private：迁移过来的连接也必须被立即断开。
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("fhot", entry, sinkB, true, false, false)}); err != nil {
+		t.Fatal(err)
+	}
+	waitConnClosed(t, conn)
 }
