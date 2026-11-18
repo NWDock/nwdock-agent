@@ -54,6 +54,10 @@ func TestUserJSON(t *testing.T) {
 	if explicit["method"] != "chacha20-poly1305" {
 		t.Fatalf("explicit method must win: %v", explicit)
 	}
+	ss2022User := userJSON(sharedDesired{Protocol: "shadowsocks", Method: "2022-blake3-aes-256-gcm"}, "sub1", "psk")
+	if _, hasMethod := ss2022User["method"]; hasMethod {
+		t.Fatalf("shadowsocks 2022 user must omit method for xray adu: %v", ss2022User)
+	}
 }
 
 func TestUserFile(t *testing.T) {

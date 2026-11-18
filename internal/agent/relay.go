@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -201,22 +203,95 @@ func (s *relayTCPSession) closeConns() {
 	})
 }
 
+// armedChainProbe 是多链转发末跳挂载的一次性贯穿探针令牌（10 秒 TTL，TCP/UDP 各单次原子消费）。
+type armedChainProbe struct {
+	token     [32]byte
+	expiresAt time.Time
+	tcpDone   atomic.Bool
+	udpDone   atomic.Bool
+}
+
+const (
+	chainProbeMagic    = "NWDPROBE"
+	chainProbeFrameLen = len(chainProbeMagic) + 32
+	chainProbePeekWait = 150 * time.Millisecond
+)
+
+func chainProbeFrame(token [32]byte) []byte {
+	out := make([]byte, chainProbeFrameLen)
+	copy(out, chainProbeMagic)
+	copy(out[len(chainProbeMagic):], token[:])
+	return out
+}
+
 // relayEngine 按面板清单维护入口转发：legacy 与独立转发合并在同一 engine、
 // 各自按键收敛；只开、关有变化的条目，撤销时关闭会话，同键仅目标变化时保留已建立的 TCP。
 type relayEngine struct {
 	mu              sync.Mutex
 	dir             string
 	handles         map[string]*relayHandle
-	persist         []relaySpec     // legacy 最近一次落盘清单，用于跳过无变化的写盘
-	fwdPersist      []relaySpec     // 独立转发最近一次落盘清单
-	liveForwards    map[string]bool // 当前生效的独立转发 id 集合
-	retiredForwards map[string]bool // 已撤销、等面板 stats_ack 确认后退休的 id
+	persist         []relaySpec                 // legacy 最近一次落盘清单，用于跳过无变化的写盘
+	fwdPersist      []relaySpec                 // 独立转发最近一次落盘清单
+	liveForwards    map[string]bool             // 当前生效的独立转发 id 集合
+	retiredForwards map[string]bool             // 已撤销、等面板 stats_ack 确认后退休的 id
+	probes          map[string]*armedChainProbe // forward id -> 末跳一次性贯穿令牌
 }
 
 var relayEng = &relayEngine{
 	handles:         map[string]*relayHandle{},
 	liveForwards:    map[string]bool{},
 	retiredForwards: map[string]bool{},
+	probes:          map[string]*armedChainProbe{},
+}
+
+// armRelayProbe 在指定 forward id 上挂载一次性贯穿令牌；句柄不存在或监听失败时直接报错。
+func armRelayProbe(forwardID string, token [32]byte, ttl time.Duration) error {
+	if !validForwardID(forwardID) {
+		return errors.New("invalid forward id")
+	}
+	if ttl <= 0 || ttl > 30*time.Second {
+		ttl = 10 * time.Second
+	}
+	now := time.Now()
+	relayEng.mu.Lock()
+	defer relayEng.mu.Unlock()
+	for k, p := range relayEng.probes {
+		if now.After(p.expiresAt) || (p.tcpDone.Load() && p.udpDone.Load()) {
+			delete(relayEng.probes, k)
+		}
+	}
+	h, ok := relayEng.handles[relayForwardKey(forwardID)]
+	if !ok {
+		return errors.New("末跳转发规则尚未生效")
+	}
+	if h.err != "" {
+		return fmt.Errorf("末跳转发端口监听异常: %s", h.err)
+	}
+	if relayEng.probes == nil {
+		relayEng.probes = map[string]*armedChainProbe{}
+	}
+	relayEng.probes[forwardID] = &armedChainProbe{
+		token:     token,
+		expiresAt: now.Add(ttl),
+	}
+	return nil
+}
+
+func (e *relayEngine) activeProbe(forwardID string) *armedChainProbe {
+	if forwardID == "" {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p := e.probes[forwardID]
+	if p == nil {
+		return nil
+	}
+	if time.Now().After(p.expiresAt) || (p.tcpDone.Load() && p.udpDone.Load()) {
+		delete(e.probes, forwardID)
+		return nil
+	}
+	return p
 }
 
 // retireConfirmedForwards 退休「已撤销且面板已确认收到最后一笔」的转发计数。
@@ -766,6 +841,51 @@ func closeWrite(c net.Conn) {
 // 计数的 forward id 取自 handle 规格，端口复用或目标变化都不串账。
 func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
 	defer client.Close()
+	var prefetched []byte
+	if ap := e.activeProbe(h.spec.ForwardID); ap != nil && !ap.tcpDone.Load() {
+		want := chainProbeFrame(ap.token)
+		peek := make([]byte, chainProbeFrameLen)
+		n := 0
+		var rerr error
+		_ = client.SetReadDeadline(time.Now().Add(chainProbePeekWait))
+		for n < chainProbeFrameLen {
+			nr, err := client.Read(peek[n:])
+			if nr > 0 {
+				n += nr
+				if !bytes.Equal(peek[:n], want[:n]) {
+					break
+				}
+			}
+			if err != nil {
+				rerr = err
+				break
+			}
+		}
+		_ = client.SetReadDeadline(time.Time{})
+		if n == chainProbeFrameLen && bytes.Equal(peek, want) && ap.tcpDone.CompareAndSwap(false, true) {
+			dialStart := time.Now()
+			dialCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			up, derr := h.spec.dialContext(dialCtx, "tcp", h.spec.target())
+			cancel()
+			if derr != nil {
+				_, _ = fmt.Fprintf(client, "NWDPROBE_ERR:%s\n", relayTruncate(strings.ReplaceAll(derr.Error(), "\n", " ")))
+				return
+			}
+			ms := int(time.Since(dialStart).Milliseconds())
+			if ms < 1 {
+				ms = 1
+			}
+			_ = up.Close()
+			_, _ = fmt.Fprintf(client, "NWDPROBE_OK:%d\n", ms)
+			return
+		}
+		if rerr != nil && !errors.Is(rerr, os.ErrDeadlineExceeded) && n == 0 {
+			return
+		}
+		if n > 0 {
+			prefetched = peek[:n]
+		}
+	}
 	up, err := h.spec.dial("tcp", h.spec.target())
 	if err != nil {
 		return
@@ -778,8 +898,13 @@ func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
 	defer e.unregisterTCPSession(session)
 	defer session.closeConns()
 	defer relayWakeStats()
-	done := make(chan struct{}, 2)
 	fwd := h.spec.ForwardID
+	if len(prefetched) > 0 {
+		if _, err := (relayCountingWriter{dst: up, upload: true, fwd: fwd}).Write(prefetched); err != nil {
+			return
+		}
+	}
+	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(relayCountingWriter{dst: up, upload: true, fwd: fwd}, client)
 		closeWrite(up)
@@ -808,6 +933,21 @@ func (e *relayEngine) serveUDP(t *relayUDP, sp relaySpec) {
 		}
 		if n == 0 {
 			continue
+		}
+		if n == chainProbeFrameLen && sp.ForwardID != "" {
+			if ap := e.activeProbe(sp.ForwardID); ap != nil && !ap.udpDone.Load() &&
+				bytes.Equal(buf[:n], chainProbeFrame(ap.token)) && ap.udpDone.CompareAndSwap(false, true) {
+				dialCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				up, derr := sp.dialContext(dialCtx, "udp", target)
+				cancel()
+				if derr != nil {
+					_, _ = t.pc.WriteTo([]byte("NWDPROBE_ERR:"+relayTruncate(strings.ReplaceAll(derr.Error(), "\n", " "))), addr)
+				} else {
+					_ = up.Close()
+					_, _ = t.pc.WriteTo([]byte("NWDPROBE_OK"), addr)
+				}
+				continue
+			}
 		}
 		key := addr.String()
 		s, startDial := t.lookupOrStartDial(key)
@@ -1154,4 +1294,5 @@ func relayStop() {
 		relayEng.closeHandleLocked(h, false)
 		delete(relayEng.handles, key)
 	}
+	relayEng.probes = map[string]*armedChainProbe{}
 }

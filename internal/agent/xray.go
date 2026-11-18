@@ -280,8 +280,12 @@ func coreEnv(kind coreKind, dir string) []string {
 	return env
 }
 
+var desiredApplyMu sync.Mutex
+
 // applyDesired 应用面板经加密通道推送的 desired 载荷（现 desired 端点响应原样）。
 func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
+	desiredApplyMu.Lock()
+	defer desiredApplyMu.Unlock()
 	api := coreAPIAddr()
 	var body desiredBody
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -317,6 +321,10 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 			proc.skeleton = string(bytes.TrimSpace(raw))
 		}
 		proc.loaded = true
+	}
+	diskGen := appliedGeneration(s.cfg.DataDir)
+	if diskGen > 0 && body.Generation > 0 && body.Generation <= diskGen && runningLocked() == body.Serving && (!body.Serving || proc.core == want) {
+		return nil
 	}
 	if body.Generation == proc.generation && runningLocked() == body.Serving && (!body.Serving || proc.core == want) {
 		return nil
@@ -361,6 +369,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		}
 		return err
 	}
+	current := filepath.Join(s.cfg.DataDir, coreConfigName(want))
+	prevBytes, prevErr := os.ReadFile(current)
 	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, filled, body.Files)
 	if err != nil {
 		if switching {
@@ -368,6 +378,7 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		}
 		return err
 	}
+	configUnchanged := prevErr == nil && bytes.Equal(prevBytes, rendered)
 	var raws map[string][]byte
 	var skel string
 	if want == coreXray {
@@ -380,7 +391,6 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 			return err
 		}
 	}
-	current := filepath.Join(s.cfg.DataDir, coreConfigName(want))
 	switch {
 	case switching:
 		stopLocked()
@@ -392,6 +402,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		if err := bootWithRollback(ctx, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
 			return err
 		}
+	case want == coreSingbox && !geoChanged && !changed && configUnchanged:
+		// 仅转发端口（relays/forwards）变更而 sing-box 核心配置、证书、geo 分毫无变时跳过重启，不断既有代理连接。
 	default:
 		plan := sameCorePlan(want, proc.skeleton != skel)
 		if geoChanged && want != coreMihomo {
@@ -599,6 +611,39 @@ func (s *session) handleLogReq(ctx context.Context, raw json.RawMessage) {
 		return
 	}
 	if err := s.send(ctx, message{T: msgLogResp, D: rawRes}); err != nil {
+		logf(levelWarning, "%s", err.Error())
+	}
+}
+
+// handleSyncReq 同步应用面板附带的 desired 载荷，并立刻回传已应用世代与转发端口监听状态。
+func (s *session) handleSyncReq(ctx context.Context, raw json.RawMessage) {
+	var req struct {
+		ID      string          `json:"id"`
+		Desired json.RawMessage `json:"desired"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
+		return
+	}
+	res := map[string]any{"id": req.ID, "ok": true}
+	if len(req.Desired) > 0 {
+		if err := s.applyDesired(ctx, req.Desired); err != nil {
+			setError(err)
+			res["ok"] = false
+			res["error"] = safeOut([]byte(err.Error()))
+		} else {
+			setError(nil)
+		}
+	}
+	states, relayTotal, relayTruncated := relayHeartbeatStates()
+	res["generation"] = appliedGeneration(s.cfg.DataDir)
+	res["relay"] = states
+	res["relay_total"] = relayTotal
+	res["relay_truncated"] = relayTruncated
+	rawRes, err := json.Marshal(res)
+	if err != nil {
+		return
+	}
+	if err := s.send(ctx, message{T: msgSyncResp, D: rawRes}); err != nil {
 		logf(levelWarning, "%s", err.Error())
 	}
 }

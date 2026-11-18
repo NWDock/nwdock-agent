@@ -830,7 +830,7 @@ func TestChannelServeForwardsDesired(t *testing.T) {
 			return
 		}
 		feats, _ := payload["features"].([]any)
-		if len(feats) != 1 || feats[0] != "forward-v1" {
+		if len(feats) != 2 || feats[0] != "forward-v1" || feats[1] != "probe-v1" {
 			t.Errorf("desired_req features %v", payload["features"])
 			return
 		}

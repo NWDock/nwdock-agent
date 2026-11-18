@@ -50,7 +50,10 @@ func userJSON(item sharedDesired, email, secret string) map[string]any {
 			if method == "" {
 				method = "aes-256-gcm"
 			}
-			user["method"] = method
+			// Shadowsocks 2022 多用户模式下 Xray 要求 clients 项的 method 留空，否则 adu 报错。
+			if !isSS2022(method) {
+				user["method"] = method
+			}
 		}
 	}
 	return user

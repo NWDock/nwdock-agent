@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -46,19 +47,30 @@ const (
 	msgStatsAck   = "stats_ack"
 	msgDesiredReq = "desired_req"
 	msgDesired    = "desired"
-	// req/resp 对：面板主动拉起信息（重启结果、日志），带 id 应答；与 panel 侧常量逐字一致。
+	// req/resp 对：面板主动拉起信息（重启结果、日志、同步配置、端到端与整链探测），带 id 应答；与 panel 侧常量逐字一致。
 	msgRestart       = "restart"
 	msgRestartResult = "restart_result"
 	msgLogReq        = "log_req"
 	msgLogResp       = "log_resp"
+	msgSyncReq       = "sync_req"
+	msgSyncResp      = "sync_resp"
+	msgProbeReq      = "probe_req"
+	msgProbeResp     = "probe_resp"
+	msgProbeCancel   = "probe_cancel"
+	msgProbeArm      = "probe_arm"
+	msgProbeArmResp  = "probe_arm_resp"
 )
 
 // featureForwardV1 声明 agent 支持独立转发（desired.forwards、per-forward 计数）；
+// featureProbeV1 声明 agent 支持节点端到端测试与转发链整链贯穿探测；
 // 随 desired_req 与 heartbeat 上报，旧面板忽略未知字段。
-const featureForwardV1 = "forward-v1"
+const (
+	featureForwardV1 = "forward-v1"
+	featureProbeV1   = "probe-v1"
+)
 
 // channelFeatures 是 agent 能力声明，字段追加只增不删。
-var channelFeatures = []string{featureForwardV1}
+var channelFeatures = []string{featureForwardV1, featureProbeV1}
 
 // message 是握手后每个 binary 帧的明文：紧凑 JSON {"t":"<type>","d":<任意 JSON>}。
 type message struct {
@@ -342,8 +354,41 @@ func (s *session) serve(ctx context.Context) error {
 	heartbeat := time.NewTicker(heartbeatInterval)
 	defer heartbeat.Stop()
 	var lastStats time.Time
-	gotDesired := false
-	retryDesired := false
+	var gotDesired atomic.Bool
+	var retryDesired atomic.Bool
+
+	// desired 放在单槽合并协程处理：连续推进多世代时自动折叠中间旧帧（避免 sing-box 排队连环重启），
+	// 同时不阻塞主循环消费心跳、sync_req、probe_req 与 probe_cancel。
+	var desiredMu sync.Mutex
+	var pendingDesired json.RawMessage
+	desiredWake := make(chan struct{}, 1)
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	defer cancelWorker()
+	go func() {
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-desiredWake:
+			}
+			desiredMu.Lock()
+			raw := pendingDesired
+			pendingDesired = nil
+			desiredMu.Unlock()
+			if len(raw) == 0 {
+				continue
+			}
+			if err := s.applyDesired(workerCtx, raw); err != nil {
+				setError(err)
+				logf(levelError, "%s", err.Error())
+				retryDesired.Store(true)
+				continue
+			}
+			setError(nil)
+			retryDesired.Store(false)
+		}
+	}()
+
 	// pingCh 为 nil 时 select 不会选中。ping 在旁路等 pong，主循环继续收帧，
 	// 否则等 pong 的 20s 内不消费 inbox，读协程离开 Read 后 pong 永远进不来。
 	var pingCh chan error
@@ -365,7 +410,7 @@ func (s *session) serve(ctx context.Context) error {
 			if err := s.sendHeartbeat(ctx); err != nil {
 				return err
 			}
-			if !gotDesired || retryDesired {
+			if !gotDesired.Load() || retryDesired.Load() {
 				if err := s.requestDesired(ctx); err != nil {
 					return err
 				}
@@ -388,20 +433,29 @@ func (s *session) serve(ctx context.Context) error {
 			}
 			switch frame.msg.T {
 			case msgDesired:
-				gotDesired = true
-				if err := s.applyDesired(ctx, frame.msg.D); err != nil {
-					setError(err)
-					logf(levelError, "%s", err.Error())
-					retryDesired = true
-					continue
+				gotDesired.Store(true)
+				desiredMu.Lock()
+				pendingDesired = frame.msg.D
+				desiredMu.Unlock()
+				select {
+				case desiredWake <- struct{}{}:
+				default:
 				}
-				setError(nil)
-				retryDesired = false
 			case msgRestart:
 				// 重启耗时（配置预检、启停、回滚），不阻塞消息循环。
 				go s.handleRestart(ctx, frame.msg.D)
 			case msgLogReq:
 				s.handleLogReq(ctx, frame.msg.D)
+			case msgSyncReq:
+				// 同步应用 desired 并回执监听结果（用于临时探测租约下发与回收）。
+				go s.handleSyncReq(ctx, frame.msg.D)
+			case msgProbeReq:
+				// 端到端拨号与测速可能持续数秒，独立协程执行以免阻塞心跳。
+				go s.handleProbeReq(ctx, frame.msg.D)
+			case msgProbeCancel:
+				s.handleProbeCancel(frame.msg.D)
+			case msgProbeArm:
+				s.handleProbeArm(ctx, frame.msg.D)
 			}
 		}
 	}
