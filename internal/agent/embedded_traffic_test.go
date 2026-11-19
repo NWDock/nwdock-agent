@@ -438,3 +438,323 @@ func TestEmbeddedApplyPartialFailureDropsClosedListener(t *testing.T) {
 	}
 	_ = c.Close()
 }
+
+func TestEmbeddedSharedShadowsocksMultiUserAndHotReload(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = echoLn.Close() })
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+	echoPort := uint16(echoLn.Addr().(*net.TCPAddr).Port)
+
+	udpEcho, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = udpEcho.Close() })
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := udpEcho.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udpEcho.WriteTo(buf[:n], addr)
+		}
+	}()
+	udpEchoAddr := udpEcho.LocalAddr().(*net.UDPAddr)
+
+	portAEAD := freePort(t)
+	port2022 := freePort(t)
+	// 32-byte base64 keys for 2022-blake3-aes-256-gcm
+	const aeadSkeletonSecret = "c2tlbGV0b24tc2VjcmV0LWZvci10ZXN0LW9ubHktMTIzNA=="
+	const serverPSK = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	const user1PSK = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+	const user2PSK = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+	const user3PSK = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+
+	dir := t.TempDir()
+	cfgYAML := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: sh-aead
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %d
+    cipher: aes-256-gcm
+    password: %s
+    udp: true
+  - name: sh-2022
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %d
+    cipher: 2022-blake3-aes-256-gcm
+    password: %s
+    udp: true
+rules:
+  - IN-NAME,sh-aead,DIRECT
+  - IN-NAME,sh-2022,DIRECT
+  - MATCH,REJECT
+`, portAEAD, aeadSkeletonSecret, port2022, serverPSK)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	shared := []sharedDesired{
+		{
+			Tag: "sh-aead", Protocol: "shadowsocks", Method: "aes-256-gcm",
+			Users: []sharedUser{
+				{Email: "sub-a1", Secret: "pass-alpha-0001"},
+				{Email: "sub-a2", Secret: "pass-bravo-0002"},
+			},
+		},
+		{
+			Tag: "sh-2022", Protocol: "shadowsocks", Method: "2022-blake3-aes-256-gcm",
+			Users: []sharedUser{
+				{Email: "sub-b1", Secret: user1PSK},
+				{Email: "sub-b2", Secret: user2PSK},
+			},
+		},
+	}
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Test(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Test config failed: %v", err)
+	}
+	if err := rt.StartShared(context.Background(), cfgPath, dir, shared); err != nil {
+		t.Fatalf("StartShared failed: %v", err)
+	}
+	t.Cleanup(rt.Stop)
+
+	makeClient := func(name string, port int, cipher, password string, uot bool) C.ProxyAdapter {
+		c, err := outbound.NewShadowSocks(outbound.ShadowSocksOption{
+			Name: name, Server: "127.0.0.1", Port: port,
+			Cipher: cipher, Password: password, UDP: true,
+			UDPOverTCP: uot, UDPOverTCPVersion: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+
+	ca1 := makeClient("ca1", portAEAD, "aes-256-gcm", "pass-alpha-0001", false)
+	ca2 := makeClient("ca2", portAEAD, "aes-256-gcm", "pass-bravo-0002", true)
+	cb1 := makeClient("cb1", port2022, "2022-blake3-aes-256-gcm", serverPSK+":"+user1PSK, false)
+	cb2 := makeClient("cb2", port2022, "2022-blake3-aes-256-gcm", serverPSK+":"+user2PSK, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	roundTripTCP := func(client C.ProxyAdapter, payload string) net.Conn {
+		conn, err := client.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: echoPort})
+		if err != nil {
+			t.Fatalf("%s dial tcp: %v", client.Name(), err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write([]byte(payload)); err != nil {
+			t.Fatalf("%s write tcp: %v", client.Name(), err)
+		}
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("%s read tcp: %v", client.Name(), err)
+		}
+		if string(got) != payload {
+			t.Fatalf("%s echo mismatch: got %q want %q", client.Name(), got, payload)
+		}
+		return conn
+	}
+
+	roundTripUDP := func(client C.ProxyAdapter, payload string) {
+		pc, err := client.ListenPacketContext(ctx, &C.Metadata{
+			NetWork: C.UDP, DstIP: netip.MustParseAddr("127.0.0.1"), DstPort: uint16(udpEchoAddr.Port),
+		})
+		if err != nil {
+			t.Fatalf("%s dial udp: %v", client.Name(), err)
+		}
+		defer pc.Close()
+		_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := pc.WriteTo([]byte(payload), udpEchoAddr); err != nil {
+			t.Fatalf("%s write udp: %v", client.Name(), err)
+		}
+		buf := make([]byte, 256)
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("%s read udp: %v", client.Name(), err)
+		}
+		if string(buf[:n]) != payload {
+			t.Fatalf("%s udp mismatch: got %q want %q", client.Name(), buf[:n], payload)
+		}
+	}
+
+	// 同端口双用户 TCP + 原生 UDP + UoT 并发通行。
+	connKeep := roundTripTCP(cb1, "keep-alive-before")
+	defer connKeep.Close()
+	connRevoke := roundTripTCP(cb2, "revoke-me-before")
+	defer connRevoke.Close()
+	// 保持一条 UoT 长连接，验证热删用户时 UoT 连接同样立刻掐断，而保留用户的 UoT 不受影响。
+	cb1UoT := makeClient("cb1-uot", port2022, "2022-blake3-aes-256-gcm", serverPSK+":"+user1PSK, true)
+	uotKeep, err := cb1UoT.ListenPacketContext(ctx, &C.Metadata{
+		NetWork: C.UDP, DstIP: netip.MustParseAddr("127.0.0.1"), DstPort: uint16(udpEchoAddr.Port),
+	})
+	if err != nil {
+		t.Fatalf("cb1-uot dial: %v", err)
+	}
+	defer uotKeep.Close()
+	uotRevoke, err := cb2.ListenPacketContext(ctx, &C.Metadata{
+		NetWork: C.UDP, DstIP: netip.MustParseAddr("127.0.0.1"), DstPort: uint16(udpEchoAddr.Port),
+	})
+	if err != nil {
+		t.Fatalf("cb2-uot dial: %v", err)
+	}
+	defer uotRevoke.Close()
+	checkUoTPacket := func(pc C.PacketConn, payload string) error {
+		_ = pc.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, werr := pc.WriteTo([]byte(payload), udpEchoAddr); werr != nil {
+			return werr
+		}
+		b := make([]byte, 256)
+		n, _, rerr := pc.ReadFrom(b)
+		if rerr != nil {
+			return rerr
+		}
+		if string(b[:n]) != payload {
+			return fmt.Errorf("got %q want %q", b[:n], payload)
+		}
+		return nil
+	}
+	if err := checkUoTPacket(uotKeep, "uot-keep-before"); err != nil {
+		t.Fatalf("uotKeep before reload: %v", err)
+	}
+	if err := checkUoTPacket(uotRevoke, "uot-revoke-before"); err != nil {
+		t.Fatalf("uotRevoke before reload: %v", err)
+	}
+	c1 := roundTripTCP(ca1, "hello-a1")
+	_ = c1.Close()
+	c2 := roundTripTCP(ca2, "hello-a2")
+	_ = c2.Close()
+
+	roundTripUDP(ca1, "udp-native-a1")
+	roundTripUDP(ca2, "udp-uot-a2")
+	roundTripUDP(cb1, "udp-native-b1")
+	roundTripUDP(cb2, "udp-uot-b2")
+
+	// 验证 user>>>、inbound>>>、pair>>> 三组计数器全部就位。
+	ctrs := traffic.counters()
+	for _, key := range []string{
+		"user>>>sub-a1>>>traffic>>>uplink",
+		"user>>>sub-a2>>>traffic>>>uplink",
+		"user>>>sub-b1>>>traffic>>>uplink",
+		"user>>>sub-b2>>>traffic>>>uplink",
+		"inbound>>>sh-aead>>>traffic>>>uplink",
+		"inbound>>>sh-2022>>>traffic>>>uplink",
+		"pair>>>sub-a1>>>sh-aead>>>traffic>>>uplink",
+		"pair>>>sub-b2>>>sh-2022>>>traffic>>>downlink",
+	} {
+		if ctrs[key] <= 0 {
+			t.Fatalf("missing or zero counter %s in %v", key, ctrs)
+		}
+	}
+
+	// 先新增 sub-b3（触发 keptGens 留存），再校验重复 email 不误判变更。
+	ss2022Lis, ok := rt.listeners["sh-2022"].(*embeddedSSListener)
+	if !ok {
+		t.Fatalf("expected embeddedSSListener for sh-2022, got %T", rt.listeners["sh-2022"])
+	}
+	sharedAdd := []sharedDesired{
+		shared[0],
+		{
+			Tag: "sh-2022", Protocol: "shadowsocks", Method: "2022-blake3-aes-256-gcm",
+			Users: []sharedUser{
+				{Email: "sub-b1", Secret: user1PSK},
+				{Email: "sub-b2", Secret: user2PSK},
+				{Email: "sub-b3", Secret: user3PSK},
+			},
+		},
+	}
+	if err := rt.Apply(context.Background(), cfgPath, dir, nil, "", sharedAdd, false, false); err != nil {
+		t.Fatalf("hot add Apply failed: %v", err)
+	}
+	genAfterAdd := ss2022Lis.gen.Load()
+	if _, err := ss2022Lis.UpdateUsers([]sharedUser{
+		{Email: "sub-b1", Secret: user1PSK},
+		{Email: "sub-b1", Secret: user1PSK},
+		{Email: "sub-b2", Secret: user2PSK},
+		{Email: "sub-b3", Secret: user3PSK},
+	}); err != nil {
+		t.Fatalf("duplicate email UpdateUsers: %v", err)
+	}
+	if ss2022Lis.gen.Load() != genAfterAdd {
+		t.Fatal("duplicate email in want list triggered unexpected generation rebuild")
+	}
+
+	// 热更新：从 sh-2022 移除 sub-b2 和 sub-b3，保留 sub-b1，同时验证 keptGens 被全部清空。
+	sharedAfter := []sharedDesired{
+		shared[0],
+		{
+			Tag: "sh-2022", Protocol: "shadowsocks", Method: "2022-blake3-aes-256-gcm",
+			Users: []sharedUser{{Email: "sub-b1", Secret: user1PSK}},
+		},
+	}
+	if err := rt.Apply(context.Background(), cfgPath, dir, nil, "", sharedAfter, false, false); err != nil {
+		t.Fatalf("hot Apply failed: %v", err)
+	}
+	ss2022Lis.mu.Lock()
+	keptCount := len(ss2022Lis.keptGens)
+	ss2022Lis.mu.Unlock()
+	if keptCount != 0 {
+		t.Fatalf("expected keptGens drained after user revocation, got %d", keptCount)
+	}
+
+	// sub-b1 的既有长连接与既有 UoT 连接必须零中断继续收发！
+	_ = connKeep.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := connKeep.Write([]byte("still-alive-after")); err != nil {
+		t.Fatalf("kept user connection broke on hot reload: %v", err)
+	}
+	still := make([]byte, len("still-alive-after"))
+	if _, err := io.ReadFull(connKeep, still); err != nil || string(still) != "still-alive-after" {
+		t.Fatalf("kept user read after hot reload: got %q err %v", still, err)
+	}
+	if err := checkUoTPacket(uotKeep, "uot-keep-after"); err != nil {
+		t.Fatalf("kept user UoT connection broke on hot reload: %v", err)
+	}
+
+	// 被移除的 sub-b2 存量 TCP 与 UoT 连接必须已被关闭，且新建连接鉴权失败。
+	_ = connRevoke.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = connRevoke.Write([]byte("should-fail"))
+	buf := make([]byte, 16)
+	if _, err := connRevoke.Read(buf); err == nil {
+		t.Fatal("expected revoked user's existing TCP connection to be closed")
+	}
+	if err := checkUoTPacket(uotRevoke, "uot-should-fail"); err == nil {
+		t.Fatal("expected revoked user's existing UoT connection to be closed")
+	}
+
+	badConn, err := cb2.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: echoPort})
+	if err == nil {
+		_ = badConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = badConn.Write([]byte("probe"))
+		if _, rerr := badConn.Read(buf); rerr == nil {
+			_ = badConn.Close()
+			t.Fatal("revoked SS2022 user succeeded dialing after removal")
+		}
+		_ = badConn.Close()
+	}
+}

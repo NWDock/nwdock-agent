@@ -475,7 +475,7 @@ func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw
 }
 
 func bootLocked(ctx context.Context, cfg Config, api, bin string, kind coreKind, current string, raws map[string][]byte, skel string, shared []sharedDesired) error {
-	if err := startLocked(ctx, kind, bin, current, cfg.DataDir); err != nil {
+	if err := startLocked(ctx, kind, bin, current, cfg.DataDir, shared); err != nil {
 		return err
 	}
 	if err := writeAppliedCore(cfg.DataDir, kind); err != nil {
@@ -655,12 +655,13 @@ func testCoreConfig(ctx context.Context, kind coreKind, bin, config, dir string)
 	return newExecRuntime(kind, bin, coreAPIAddr()).Test(ctx, config, dir)
 }
 
-func startLocked(ctx context.Context, kind coreKind, bin, config, dir string) error {
+func startLocked(ctx context.Context, kind coreKind, bin, config, dir string, shared []sharedDesired) error {
 	var rt coreRuntime
 	var err error
 	if kind == coreMihomo {
-		rt = newEmbeddedRuntime()
-		err = rt.Start(ctx, config, dir)
+		emb := newEmbeddedRuntime()
+		rt = emb
+		err = emb.StartShared(ctx, config, dir, shared)
 	} else {
 		rt = newExecRuntime(kind, bin, coreAPIAddr())
 		err = rt.Start(ctx, config, dir)

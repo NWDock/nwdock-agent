@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub/executor"
+	IN "github.com/metacubex/mihomo/listener/inbound"
 	mihomolog "github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
@@ -55,10 +56,14 @@ func (e *embeddedRuntime) Test(_ context.Context, configPath, dir string) error 
 }
 
 func (e *embeddedRuntime) Start(ctx context.Context, configPath, dir string) error {
+	return e.StartShared(ctx, configPath, dir, nil)
+}
+
+func (e *embeddedRuntime) StartShared(ctx context.Context, configPath, dir string, shared []sharedDesired) error {
 	// mihomo 自身仍打印到 stdout；这里订阅 observable 只是把事件收入日志环供面板查看。
 	e.logSub = mihomolog.Subscribe()
 	go e.captureLogs(e.logSub)
-	if err := e.Apply(ctx, configPath, dir, nil, "", nil, true, false); err != nil {
+	if err := e.Apply(ctx, configPath, dir, nil, "", shared, true, false); err != nil {
 		e.Stop()
 		return err
 	}
@@ -82,7 +87,7 @@ func mihomologLevel(level mihomolog.LogLevel) string {
 	}
 }
 
-func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, _ []sharedDesired, geoChanged, _ bool) error {
+func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, shared []sharedDesired, geoChanged, _ bool) error {
 	C.SetHomeDir(dir)
 	if geoChanged {
 		// geo 资产有变（内容更新或大小写孪生清理）时清掉核内匹配缓存：
@@ -99,10 +104,55 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 	if err := applyMihomo(cfg); err != nil {
 		return err
 	}
+	sharedSS := make(map[string]sharedDesired, len(shared))
+	for _, item := range shared {
+		if item.Protocol == "shadowsocks" && item.Tag != "" {
+			sharedSS[item.Tag] = item
+		}
+	}
+	rollbackOpened := func(next map[string]C.InboundListener) {
+		for n, opened := range next {
+			if opened != e.listeners[n] {
+				closeInboundListener(opened)
+			}
+		}
+	}
 	next := map[string]C.InboundListener{}
 	for name, lis := range listeners {
 		old := e.listeners[name]
-		if old != nil && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
+		if spec, isSharedSS := sharedSS[name]; isSharedSS {
+			if ssOpt, ok := lis.Config().(*IN.ShadowSocksOption); ok {
+				if oldSS, ok := old.(*embeddedSSListener); ok && oldSS.Config() != nil && oldSS.Config().Equal(ssOpt) {
+					dropped, err := oldSS.UpdateUsers(spec.Users)
+					if err != nil {
+						rollbackOpened(next)
+						return fmt.Errorf("update users %s: %w", name, err)
+					}
+					traffic.closeInboundUsers(name, dropped)
+					next[name] = oldSS
+					continue
+				}
+				if old != nil {
+					traffic.closeInbound(name)
+					closeInboundListener(old)
+					delete(e.listeners, name)
+				}
+				multiLis, err := newEmbeddedSSListener(ssOpt, spec.Users)
+				if err != nil {
+					rollbackOpened(next)
+					return fmt.Errorf("build shared ss %s: %w", name, err)
+				}
+				if err := multiLis.Listen(meterTunnel{}); err != nil {
+					closeInboundListener(multiLis)
+					rollbackOpened(next)
+					return fmt.Errorf("listen %s: %w", name, err)
+				}
+				next[name] = multiLis
+				continue
+			}
+		}
+		_, oldWasSharedSS := old.(*embeddedSSListener)
+		if old != nil && !oldWasSharedSS && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
 			next[name] = old
 			continue
 		}
@@ -113,11 +163,7 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 		}
 		if err := lis.Listen(meterTunnel{}); err != nil {
 			closeInboundListener(lis)
-			for n, opened := range next {
-				if opened != e.listeners[n] {
-					closeInboundListener(opened)
-				}
-			}
+			rollbackOpened(next)
 			return fmt.Errorf("listen %s: %w", name, err)
 		}
 		next[name] = lis

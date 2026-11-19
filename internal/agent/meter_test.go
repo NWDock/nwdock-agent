@@ -112,11 +112,24 @@ func TestMeterCloseInbound(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	m := testMeter(&now)
 	a, b := &closeProbe{}, &closeProbe{}
-	m.track(a, "in-a")
-	m.track(b, "in-b")
+	m.track(a, "in-a", "")
+	m.track(b, "in-b", "")
 	m.closeInbound("in-a")
 	if !a.closed || b.closed {
 		t.Fatalf("closed a=%v b=%v", a.closed, b.closed)
+	}
+}
+
+func TestMeterCloseInboundUsers(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	m := testMeter(&now)
+	u1, u2, otherIn := &closeProbe{}, &closeProbe{}, &closeProbe{}
+	m.track(u1, "sh-ss", "sub-1")
+	m.track(u2, "sh-ss", "sub-2")
+	m.track(otherIn, "sh-other", "sub-1")
+	m.closeInboundUsers("sh-ss", map[string]bool{"sub-1": true})
+	if !u1.closed || u2.closed || otherIn.closed {
+		t.Fatalf("closed u1=%v u2=%v otherIn=%v", u1.closed, u2.closed, otherIn.closed)
 	}
 }
 

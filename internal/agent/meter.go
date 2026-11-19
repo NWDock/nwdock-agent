@@ -15,10 +15,15 @@ const statsNudgeMin = 500 * time.Millisecond
 
 // trafficMeter 在入站与 clash-meta-nw 隧道之间按块计原始字节。
 // 只计数，不截断；限额由面板在下一次 desired 收敛。
+type liveConnMeta struct {
+	inbound string
+	user    string
+}
+
 type trafficMeter struct {
 	mu         sync.Mutex
 	raw        map[string]*rawCounter
-	live       map[ioCloser]string
+	live       map[ioCloser]liveConnMeta
 	lastSignal time.Time
 	wake       chan struct{}
 	now        func() time.Time
@@ -36,7 +41,7 @@ type ioCloser interface {
 func newTrafficMeter() *trafficMeter {
 	return &trafficMeter{
 		raw:  map[string]*rawCounter{},
-		live: map[ioCloser]string{},
+		live: map[ioCloser]liveConnMeta{},
 		wake: make(chan struct{}, 1),
 		now:  time.Now,
 	}
@@ -48,13 +53,14 @@ var traffic = newTrafficMeter()
 type meterTunnel struct{}
 
 func (meterTunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
-	inbound := ""
+	inbound, user := "", ""
 	if metadata != nil {
 		inbound = metadata.InName
+		user = metadata.InUser
 	}
 	ctr, inCtr, pairCtr := traffic.accept(metadata)
 	wrapped := &meterConn{m: traffic, Conn: conn, ctr: ctr, inCtr: inCtr, pairCtr: pairCtr, inbound: inbound}
-	traffic.track(wrapped, inbound)
+	traffic.track(wrapped, inbound, user)
 	tunnel.Tunnel.HandleTCPConn(wrapped, metadata)
 }
 
@@ -121,9 +127,9 @@ func (m *trafficMeter) counterLocked(key string) *rawCounter {
 	return ctr
 }
 
-func (m *trafficMeter) track(conn ioCloser, inbound string) {
+func (m *trafficMeter) track(conn ioCloser, inbound, user string) {
 	m.mu.Lock()
-	m.live[conn] = inbound
+	m.live[conn] = liveConnMeta{inbound: inbound, user: user}
 	m.mu.Unlock()
 }
 
@@ -137,8 +143,26 @@ func (m *trafficMeter) detach(conn ioCloser) {
 func (m *trafficMeter) closeInbound(name string) {
 	m.mu.Lock()
 	conns := make([]ioCloser, 0)
-	for conn, inbound := range m.live {
-		if inbound == name {
+	for conn, meta := range m.live {
+		if meta.inbound == name {
+			conns = append(conns, conn)
+		}
+	}
+	m.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// closeInboundUsers 仅关闭某个共享监听上指定用户的活跃连接，保留同端口其余用户的在线流。
+func (m *trafficMeter) closeInboundUsers(name string, users map[string]bool) {
+	if len(users) == 0 {
+		return
+	}
+	m.mu.Lock()
+	conns := make([]ioCloser, 0)
+	for conn, meta := range m.live {
+		if meta.inbound == name && users[meta.user] {
 			conns = append(conns, conn)
 		}
 	}
