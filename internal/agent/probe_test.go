@@ -509,3 +509,273 @@ func readTyped(t *testing.T, ctx context.Context, peer *panelHandle, wantType st
 		}
 	}
 }
+
+func TestPeerServeAndBidirectionalProbe(t *testing.T) {
+	resetRelay(t.TempDir())
+	resetRelayBytes()
+	t.Cleanup(func() {
+		resetRelay(t.TempDir())
+		resetRelayBytes()
+	})
+
+	var tok [32]byte
+	_, _ = rand.Read(tok[:])
+	tokHex := hex.EncodeToString(tok[:])
+
+	var badTok [32]byte
+	_, _ = rand.Read(badTok[:])
+	badTokHex := hex.EncodeToString(badTok[:])
+
+	s, _, _ := dialWithPanel(t, false, func(peer *panelHandle) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = readTyped(t, ctx, peer, msgDesiredReq)
+
+		serveReqRaw, _ := json.Marshal(map[string]any{
+			"id":          "peer-srv-1",
+			"listen_host": "127.0.0.1",
+			"port":        0,
+			"token_hex":   tokHex,
+			"ttl_ms":      15000,
+		})
+		if err := peer.send(ctx, message{T: msgPeerServeReq, D: serveReqRaw}); err != nil {
+			t.Errorf("send peer_serve_req: %v", err)
+			return
+		}
+		serveRespRaw := readTyped(t, ctx, peer, msgPeerServeResp)
+		var serveResp struct {
+			ID    string `json:"id"`
+			OK    bool   `json:"ok"`
+			Port  int    `json:"port"`
+			UDPOK bool   `json:"udp_ok"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(serveRespRaw, &serveResp); err != nil || !serveResp.OK || serveResp.Port <= 0 || !serveResp.UDPOK {
+			t.Errorf("unexpected peer_serve_resp: %s (%v)", string(serveRespRaw), err)
+			return
+		}
+
+		// 错误令牌应无法完成双向测速握手。
+		badProbe := executeProbe(ctx, probeRequest{
+			ID:           "peer-bad",
+			Host:         "127.0.0.1",
+			Port:         serveResp.Port,
+			AllowPrivate: true,
+			RunTCPing:    true,
+			PeerToken:    badTokHex,
+			PeerUDP:      true,
+			PeerSpeed:    true,
+			PeerDir:      "both",
+			PeerBytes:    64 << 10,
+		})
+		if badProbe.PeerUDP == nil || badProbe.PeerUDP.Status != "error" {
+			t.Errorf("expected bad token UDP to fail, got %+v", badProbe.PeerUDP)
+			return
+		}
+		if badProbe.PeerRecv == nil || badProbe.PeerRecv.Status != "error" {
+			t.Errorf("expected bad token TCP stream to fail, got %+v", badProbe.PeerRecv)
+			return
+		}
+
+		// 正确令牌执行 Ping + TCPing + UDP 往返 + 双向 512 KiB 流测速。
+		goodReqRaw, _ := json.Marshal(probeRequest{
+			ID:           "peer-good",
+			Host:         "127.0.0.1",
+			Port:         serveResp.Port,
+			AllowPrivate: true,
+			RunPing:      true,
+			RunTCPing:    true,
+			PeerToken:    tokHex,
+			PeerUDP:      true,
+			PeerSpeed:    true,
+			PeerDir:      "both",
+			PeerBytes:    512 << 10,
+		})
+		if err := peer.send(ctx, message{T: msgProbeReq, D: goodReqRaw}); err != nil {
+			t.Errorf("send probe_req: %v", err)
+			return
+		}
+		probeRespRaw := readTyped(t, ctx, peer, msgProbeResp)
+		var pr probeResponse
+		if err := json.Unmarshal(probeRespRaw, &pr); err != nil {
+			t.Errorf("unmarshal probe_resp: %v", err)
+			return
+		}
+		if pr.TCPing == nil || pr.TCPing.Status != "ok" {
+			t.Errorf("tcping failed: %+v", pr.TCPing)
+		}
+		if pr.PeerUDP == nil || pr.PeerUDP.Status != "ok" || pr.PeerUDP.LossPct != 0 {
+			t.Errorf("peer udp failed: %+v", pr.PeerUDP)
+		}
+		if pr.PeerSend == nil || pr.PeerSend.Status != "ok" || pr.PeerSend.Bytes != 512<<10 {
+			t.Errorf("peer send failed: %+v", pr.PeerSend)
+		}
+		if pr.PeerRecv == nil || pr.PeerRecv.Status != "ok" || pr.PeerRecv.Bytes != 512<<10 {
+			t.Errorf("peer recv failed: %+v", pr.PeerRecv)
+		}
+
+		// 验证 4 并发流 + 预热去慢启动 + 定长稳态采样 + 链内应用层 TCP RTT 探测。
+		steadyProbe := executeProbe(ctx, probeRequest{
+			ID:           "peer-steady-4",
+			Host:         "127.0.0.1",
+			Port:         serveResp.Port,
+			AllowPrivate: true,
+			PeerToken:    tokHex,
+			PeerTCP:      true,
+			PeerUDP:      true,
+			PeerSpeed:    true,
+			PeerDir:      "both",
+			Streams:      4,
+			WarmupMs:     80,
+			DurationMs:   400,
+		})
+		if steadyProbe.PeerTCP == nil || steadyProbe.PeerTCP.Status != "ok" {
+			t.Errorf("peer tcp failed: %+v", steadyProbe.PeerTCP)
+		}
+		if steadyProbe.PeerSend == nil || steadyProbe.PeerSend.Status != "ok" || steadyProbe.PeerSend.Streams != 4 || steadyProbe.PeerSend.Mbps <= 0 {
+			t.Errorf("steady multi-stream send failed: %+v", steadyProbe.PeerSend)
+		}
+		if steadyProbe.PeerRecv == nil || steadyProbe.PeerRecv.Status != "ok" || steadyProbe.PeerRecv.Streams != 4 || steadyProbe.PeerRecv.Mbps <= 0 {
+			t.Errorf("steady multi-stream recv failed: %+v", steadyProbe.PeerRecv)
+		}
+
+		// 发送 peer_stop 立即关闭端口。
+		stopRaw, _ := json.Marshal(map[string]string{"id": "peer-srv-1"})
+		_ = peer.send(ctx, message{T: msgPeerStop, D: stopRaw})
+		time.Sleep(80 * time.Millisecond)
+		if c, derr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(serveResp.Port)), 250*time.Millisecond); derr == nil {
+			_ = c.Close()
+			t.Errorf("peer port %d still open after peer_stop", serveResp.Port)
+		}
+
+		_ = peer.conn.Close(websocket.StatusNormalClosure, "done")
+	})
+
+	if err := s.serve(context.Background()); err == nil {
+		t.Fatal("expected close error")
+	}
+}
+
+func TestDirectPublicMultiStreamProbe(t *testing.T) {
+	origGuard := probeURLGuardEnabled
+	probeURLGuardEnabled = false
+	t.Cleanup(func() { probeURLGuardEnabled = origGuard })
+
+	payload := bytes.Repeat([]byte("A5Z9"), 16<<10) // 64 KiB
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/204" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 64; i++ {
+			if _, err := w.Write(payload); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res := executeProbe(ctx, probeRequest{
+		ID:            "direct-pub-1",
+		DirectURLTest: true,
+		LatencyURL:    srv.URL + "/204",
+		SpeedTest:     true,
+		SpeedURL:      srv.URL + "/down",
+		Streams:       4,
+		WarmupMs:      80,
+		DurationMs:    400,
+	})
+	if res.URLTest == nil || res.URLTest.Status != "ok" || res.URLTest.HTTPStatus != http.StatusNoContent {
+		t.Fatalf("direct url test failed: %+v", res.URLTest)
+	}
+	if res.Speed == nil || res.Speed.Status != "ok" || res.Speed.Streams != 4 || res.Speed.Bytes <= 0 {
+		t.Fatalf("direct multi-stream speed test failed: %+v", res.Speed)
+	}
+}
+
+func TestDirectPublicSpeedFollowsCrossHostRedirectAndPeerStopClosesConns(t *testing.T) {
+	origGuard := probeURLGuardEnabled
+	probeURLGuardEnabled = false
+	t.Cleanup(func() { probeURLGuardEnabled = origGuard })
+
+	payload := bytes.Repeat([]byte("R3D1"), 16<<10)
+	cdnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 32; i++ {
+			if _, err := w.Write(payload); err != nil {
+				return
+			}
+		}
+	}))
+	defer cdnSrv.Close()
+
+	entrySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/204" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Redirect(w, r, cdnSrv.URL+"/file.bin", http.StatusFound)
+	}))
+	defer entrySrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res := executeProbe(ctx, probeRequest{
+		ID:            "direct-redir-1",
+		DirectURLTest: true,
+		LatencyURL:    entrySrv.URL + "/204",
+		SpeedTest:     true,
+		SpeedURL:      entrySrv.URL + "/go",
+		Streams:       2,
+		WarmupMs:      50,
+		DurationMs:    400,
+	})
+	if res.Speed == nil || res.Speed.Status != "ok" || res.Speed.Bytes <= 0 {
+		t.Fatalf("expected redirected speed test to succeed, got %+v", res.Speed)
+	}
+
+	// PeerToken 非空但 Host 为空应直接报探测目标地址为空。
+	emptyRes := executeProbe(ctx, probeRequest{
+		ID:        "peer-empty-host",
+		PeerToken: strings.Repeat("aa", 32),
+		PeerTCP:   true,
+	})
+	if emptyRes.Error == "" {
+		t.Fatalf("expected top-level error for empty host with PeerToken, got %+v", emptyRes)
+	}
+
+	// peerServer.stop() 必须立刻关闭已接受的活跃测速连接。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tok [32]byte
+	_, _ = rand.Read(tok[:])
+	ps := &peerServer{id: "stop-conn-test", token: tok, tcpLn: ln, conns: map[net.Conn]struct{}{}}
+	go ps.serveTCP()
+	defer ps.stop()
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	hdr := buildPeerTCPHeader('U', tok, 64<<20, 0)
+	if _, err := c.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	readyBuf := make([]byte, len("NWDPEER_READY\n"))
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(c, readyBuf); err != nil {
+		t.Fatalf("read ready: %v", err)
+	}
+	ps.stop()
+	_ = c.SetReadDeadline(time.Now().Add(1 * time.Second))
+	one := make([]byte, 1)
+	if _, err := c.Read(one); err == nil {
+		t.Fatal("expected active peer connection to close immediately on stop()")
+	}
+}

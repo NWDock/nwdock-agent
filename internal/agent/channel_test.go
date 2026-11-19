@@ -912,7 +912,7 @@ func TestChannelMessageShapes(t *testing.T) {
 			t.Fatalf("desired_req %v", req)
 		}
 		feats, ok := req["features"].([]any)
-		if !ok || len(feats) != 2 || feats[0] != "forward-v1" || feats[1] != "probe-v1" {
+		if !ok || len(feats) != 3 || feats[0] != "forward-v1" || feats[1] != "probe-v1" || feats[2] != "peer-probe-v1" {
 			t.Fatalf("desired_req features %v", req["features"])
 		}
 		beat, ok := seen["heartbeat"]
@@ -925,7 +925,7 @@ func TestChannelMessageShapes(t *testing.T) {
 			}
 		}
 		beatFeats, ok := beat["features"].([]any)
-		if !ok || len(beatFeats) != 2 || beatFeats[0] != "forward-v1" || beatFeats[1] != "probe-v1" {
+		if !ok || len(beatFeats) != 3 || beatFeats[0] != "forward-v1" || beatFeats[1] != "probe-v1" || beatFeats[2] != "peer-probe-v1" {
 			t.Fatalf("heartbeat features %v", beat["features"])
 		}
 		if _, ok := beat["relay_total"].(float64); !ok {

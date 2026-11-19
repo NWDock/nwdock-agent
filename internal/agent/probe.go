@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,7 +42,14 @@ const (
 	probeSpeedDialTimeout   = 10 * time.Second
 	probeSpeedTransferLimit = 10 * time.Second
 	probeSpeedMaxBytes      = 100 << 20
+	probeSteadyMaxBytes     = 2 << 30
 	probeSpeedDefaultBytes  = 25 << 20
+	probeDefaultStreams     = 4
+	probeMaxStreams         = 8
+	probeDefaultDurationMs  = 4000
+	probeMaxDurationMs      = 10000
+	probeDefaultWarmupMs    = 800
+	probeMaxWarmupMs        = 2000
 	probeChainTimeout       = 6 * time.Second
 )
 
@@ -60,21 +69,31 @@ var (
 )
 
 type probeRequest struct {
-	ID           string         `json:"id"`
-	Host         string         `json:"host"`
-	Port         int            `json:"port"`
-	AllowPrivate bool           `json:"allow_private,omitempty"`
-	RunPing      bool           `json:"run_ping"`
-	RunTCPing    bool           `json:"run_tcping"`
-	SkipTCPing   string         `json:"skip_tcping,omitempty"`
-	Proxy        map[string]any `json:"proxy,omitempty"`
-	LatencyURL   string         `json:"latency_url,omitempty"`
-	SpeedTest    bool           `json:"speed_test,omitempty"`
-	SpeedURL     string         `json:"speed_url,omitempty"`
-	SpeedBytes   int64          `json:"speed_bytes,omitempty"`
-	ChainToken   string         `json:"chain_token,omitempty"`
-	ChainTCP     bool           `json:"chain_tcp,omitempty"`
-	ChainUDP     bool           `json:"chain_udp,omitempty"`
+	ID            string         `json:"id"`
+	Host          string         `json:"host"`
+	Port          int            `json:"port"`
+	AllowPrivate  bool           `json:"allow_private,omitempty"`
+	RunPing       bool           `json:"run_ping"`
+	RunTCPing     bool           `json:"run_tcping"`
+	SkipTCPing    string         `json:"skip_tcping,omitempty"`
+	Proxy         map[string]any `json:"proxy,omitempty"`
+	DirectURLTest bool           `json:"direct_url_test,omitempty"`
+	LatencyURL    string         `json:"latency_url,omitempty"`
+	SpeedTest     bool           `json:"speed_test,omitempty"`
+	SpeedURL      string         `json:"speed_url,omitempty"`
+	SpeedBytes    int64          `json:"speed_bytes,omitempty"`
+	Streams       int            `json:"streams,omitempty"`
+	DurationMs    int            `json:"duration_ms,omitempty"`
+	WarmupMs      int            `json:"warmup_ms,omitempty"`
+	ChainToken    string         `json:"chain_token,omitempty"`
+	ChainTCP      bool           `json:"chain_tcp,omitempty"`
+	ChainUDP      bool           `json:"chain_udp,omitempty"`
+	PeerToken     string         `json:"peer_token,omitempty"`
+	PeerTCP       bool           `json:"peer_tcp,omitempty"`
+	PeerUDP       bool           `json:"peer_udp,omitempty"`
+	PeerSpeed     bool           `json:"peer_speed,omitempty"`
+	PeerDir       string         `json:"peer_dir,omitempty"` // both | send | recv
+	PeerBytes     int64          `json:"peer_bytes,omitempty"`
 }
 
 type probePingResult struct {
@@ -100,6 +119,7 @@ type probeSpeedResult struct {
 	DurationMs  int     `json:"duration_ms,omitempty"`
 	BytesPerSec int64   `json:"bytes_per_sec,omitempty"`
 	Mbps        float64 `json:"mbps,omitempty"`
+	Streams     int     `json:"streams,omitempty"`
 	Error       string  `json:"error,omitempty"`
 }
 
@@ -118,6 +138,10 @@ type probeResponse struct {
 	Speed    *probeSpeedResult `json:"speed,omitempty"`
 	ChainTCP *probeChainResult `json:"chain_tcp,omitempty"`
 	ChainUDP *probeChainResult `json:"chain_udp,omitempty"`
+	PeerTCP  *probePingResult  `json:"peer_tcp,omitempty"`
+	PeerUDP  *probePingResult  `json:"peer_udp,omitempty"`
+	PeerSend *probeSpeedResult `json:"peer_send,omitempty"`
+	PeerRecv *probeSpeedResult `json:"peer_recv,omitempty"`
 	Error    string            `json:"error,omitempty"`
 }
 
@@ -193,7 +217,7 @@ func (s *session) handleProbeReq(ctx context.Context, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 65*time.Second)
 	registerActiveProbe(req.ID, cancel)
 	defer func() {
 		unregisterActiveProbe(req.ID)
@@ -224,7 +248,7 @@ func executeProbe(ctx context.Context, req probeRequest) probeResponse {
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = host[1 : len(host)-1]
 	}
-	if host == "" && (req.RunPing || req.RunTCPing || req.ChainToken != "") {
+	if host == "" && (req.RunPing || req.RunTCPing || req.ChainToken != "" || req.PeerToken != "") {
 		resp.Error = "探测目标地址为空"
 		return resp
 	}
@@ -277,11 +301,20 @@ func executeProbe(ctx context.Context, req probeRequest) probeResponse {
 		}
 	}
 
-	// 代理协议端到端延迟与可选下行测速。
+	// 代理协议端到端延迟与可选下行测速，或机器本机直连公网测试。
 	if len(req.Proxy) > 0 {
 		urlRes, speedRes := runProxyProbe(ctx, req)
 		resp.URLTest = &urlRes
 		resp.Speed = &speedRes
+	} else if req.DirectURLTest {
+		urlRes, speedRes := runDirectPublicProbe(ctx, req)
+		resp.URLTest = &urlRes
+		resp.Speed = &speedRes
+	}
+
+	// 受管机器间 / 链内端到端闭环互测（TCP 全链 RTT、UDP 往返与多并发稳态双向吞吐极限，零外部依赖）。
+	if req.PeerToken != "" {
+		runPeerProbe(ctx, req, host, &resp)
 	}
 	return resp
 }
@@ -456,16 +489,14 @@ func runICMPPing(ctx context.Context, host string, allowPrivate bool) probePingR
 	return summarizePingSamples(samples, defaultProbePingCount, lastErr)
 }
 
-func runTCPing(ctx context.Context, host string, port int, skipReason string, allowPrivate bool) probePingResult {
-	if skipReason != "" {
-		return probePingResult{Status: "skipped", LossPct: 0, Error: skipReason}
+// newSafeTCPDialer 保留 Go 双栈 Happy Eyeballs 回退并在真实建连前校验对端 IP，
+// 避免手选单条解析结果在单栈机器上误报 network is unreachable，同时杜绝 DNS 重绑定 SSRF。
+func newSafeTCPDialer(timeout time.Duration, allowPrivate bool, blockedMsg string) *net.Dialer {
+	if blockedMsg == "" {
+		blockedMsg = "目标地址不是公网地址"
 	}
-	if port < 1 || port > 65535 {
-		return probePingResult{Status: "error", LossPct: 100, Error: "端口无效"}
-	}
-	target := net.JoinHostPort(host, strconv.Itoa(port))
-	dialer := &net.Dialer{
-		Timeout: probeTCPTimeout,
+	return &net.Dialer{
+		Timeout: timeout,
 		Control: func(_, address string, _ syscall.RawConn) error {
 			if allowPrivate {
 				return nil
@@ -475,11 +506,22 @@ func runTCPing(ctx context.Context, host string, port int, skipReason string, al
 				return err
 			}
 			if forwardIPBlocked(net.ParseIP(h)) {
-				return errors.New("目标地址不是公网地址")
+				return errors.New(blockedMsg)
 			}
 			return nil
 		},
 	}
+}
+
+func runTCPing(ctx context.Context, host string, port int, skipReason string, allowPrivate bool) probePingResult {
+	if skipReason != "" {
+		return probePingResult{Status: "skipped", LossPct: 0, Error: skipReason}
+	}
+	if port < 1 || port > 65535 {
+		return probePingResult{Status: "error", LossPct: 100, Error: "端口无效"}
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := newSafeTCPDialer(probeTCPTimeout, allowPrivate, "目标地址不是公网地址")
 
 	var samples []int
 	var lastErr error
@@ -590,6 +632,47 @@ func buildProxyTLSConfig(serverName string) *tls.Config {
 	}
 }
 
+func resolveSpeedParams(req probeRequest) (streams int, warmupDur, steadyDur time.Duration, maxCap int64, steadyMode bool) {
+	// 兼容旧版按固定字节数拉取的单流调用。
+	if req.DurationMs <= 0 && req.Streams <= 0 && (req.SpeedBytes > 0 || req.PeerBytes > 0) {
+		capBytes := req.SpeedBytes
+		if capBytes <= 0 {
+			capBytes = req.PeerBytes
+		}
+		if capBytes > probeSpeedMaxBytes {
+			capBytes = probeSpeedMaxBytes
+		}
+		return 1, 0, probeSpeedTransferLimit, capBytes, false
+	}
+	streams = req.Streams
+	if streams <= 0 {
+		streams = probeDefaultStreams
+	}
+	if streams > probeMaxStreams {
+		streams = probeMaxStreams
+	}
+	durMs := req.DurationMs
+	if durMs <= 0 {
+		durMs = probeDefaultDurationMs
+	}
+	if durMs < 400 {
+		durMs = 400
+	}
+	if durMs > probeMaxDurationMs {
+		durMs = probeMaxDurationMs
+	}
+	warmMs := req.WarmupMs
+	if warmMs < 0 {
+		warmMs = 0
+	} else if warmMs == 0 && durMs >= 1500 {
+		warmMs = probeDefaultWarmupMs
+	}
+	if warmMs > probeMaxWarmupMs {
+		warmMs = probeMaxWarmupMs
+	}
+	return streams, time.Duration(warmMs) * time.Millisecond, time.Duration(durMs) * time.Millisecond, probeSteadyMaxBytes, true
+}
+
 func runProxyProbe(ctx context.Context, req probeRequest) (probeURLResult, probeSpeedResult) {
 	skippedSpeed := probeSpeedResult{Status: "skipped"}
 	proxy, err := adapter.ParseProxy(req.Proxy)
@@ -609,39 +692,106 @@ func runProxyProbe(ctx context.Context, req probeRequest) (probeURLResult, probe
 		return probeURLResult{Status: "error", Error: err.Error()}, skippedSpeed
 	}
 
-	urlRes := runProxyURLTest(ctx, proxy, latURL, latMeta)
+	urlRes := runDialerURLTest(ctx, latURL, func(dctx context.Context) (net.Conn, error) {
+		m := latMeta
+		return proxy.DialContext(dctx, &m)
+	})
 	if !req.SpeedTest {
 		return urlRes, skippedSpeed
 	}
 	if urlRes.Status != "ok" {
-		return urlRes, probeSpeedResult{Status: "skipped", Error: "端到端连通未通过，已跳过测速"}
+		return urlRes, probeSpeedResult{Status: "skipped", Error: "外网连通未通过，已跳过测速"}
 	}
 
+	streams, warmupDur, steadyDur, maxCap, steadyMode := resolveSpeedParams(req)
 	speedRaw := strings.TrimSpace(req.SpeedURL)
-	maxBytes := req.SpeedBytes
-	if maxBytes <= 0 {
-		maxBytes = probeSpeedDefaultBytes
-	}
-	if maxBytes > probeSpeedMaxBytes {
-		maxBytes = probeSpeedMaxBytes
-	}
 	if speedRaw == "" {
-		speedRaw = fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", maxBytes)
+		if steadyMode {
+			speedRaw = "https://speed.cloudflare.com/__down?bytes=50000000"
+		} else {
+			reqBytes := maxCap
+			if reqBytes > 50_000_000 {
+				reqBytes = 50_000_000
+			}
+			speedRaw = fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", reqBytes)
+		}
 	}
-	spdURL, spdMeta, err := validateTargetHTTPURL(speedRaw)
+	spdURL, _, err := validateTargetHTTPURL(speedRaw)
 	if err != nil {
 		return urlRes, probeSpeedResult{Status: "error", Error: err.Error()}
 	}
-	spdRes := runProxySpeedTest(ctx, proxy, spdURL, spdMeta, maxBytes)
+	spdRes := runHTTPMultiStreamSpeedTest(ctx, spdURL, streams, warmupDur, steadyDur, maxCap, steadyMode, func(dctx context.Context, addr string) (net.Conn, error) {
+		var m C.Metadata
+		if merr := m.SetRemoteAddress(addr); merr != nil {
+			return nil, merr
+		}
+		return proxy.DialContext(dctx, &m)
+	})
 	return urlRes, spdRes
 }
 
-func runProxyURLTest(ctx context.Context, proxy C.Proxy, targetURL *url.URL, meta C.Metadata) probeURLResult {
+func runDirectPublicProbe(ctx context.Context, req probeRequest) (probeURLResult, probeSpeedResult) {
+	skippedSpeed := probeSpeedResult{Status: "skipped"}
+	latencyRaw := strings.TrimSpace(req.LatencyURL)
+	if latencyRaw == "" {
+		latencyRaw = "https://cp.cloudflare.com/generate_204"
+	}
+	latURL, _, err := validateTargetHTTPURL(latencyRaw)
+	if err != nil {
+		return probeURLResult{Status: "error", Error: err.Error()}, skippedSpeed
+	}
+
+	dialPublicAddr := func(dctx context.Context, addr string) (net.Conn, error) {
+		d := newSafeTCPDialer(probeSpeedDialTimeout, !probeURLGuardEnabled, "测试 URL 不允许指向内网地址")
+		return d.DialContext(dctx, "tcp", addr)
+	}
+	latPort := latURL.Port()
+	if latPort == "" {
+		if strings.EqualFold(latURL.Scheme, "https") {
+			latPort = "443"
+		} else {
+			latPort = "80"
+		}
+	}
+	latAddr := net.JoinHostPort(latURL.Hostname(), latPort)
+
+	urlRes := runDialerURLTest(ctx, latURL, func(dctx context.Context) (net.Conn, error) {
+		return dialPublicAddr(dctx, latAddr)
+	})
+	if !req.SpeedTest {
+		return urlRes, skippedSpeed
+	}
+	if urlRes.Status != "ok" {
+		return urlRes, probeSpeedResult{Status: "skipped", Error: "外网连通未通过，已跳过测速"}
+	}
+
+	streams, warmupDur, steadyDur, maxCap, steadyMode := resolveSpeedParams(req)
+	speedRaw := strings.TrimSpace(req.SpeedURL)
+	if speedRaw == "" {
+		if steadyMode {
+			speedRaw = "https://speed.cloudflare.com/__down?bytes=50000000"
+		} else {
+			reqBytes := maxCap
+			if reqBytes > 50_000_000 {
+				reqBytes = 50_000_000
+			}
+			speedRaw = fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", reqBytes)
+		}
+	}
+	spdURL, _, err := validateTargetHTTPURL(speedRaw)
+	if err != nil {
+		return urlRes, probeSpeedResult{Status: "error", Error: err.Error()}
+	}
+	spdRes := runHTTPMultiStreamSpeedTest(ctx, spdURL, streams, warmupDur, steadyDur, maxCap, steadyMode, dialPublicAddr)
+	return urlRes, spdRes
+}
+
+func runDialerURLTest(ctx context.Context, targetURL *url.URL, dialFn func(context.Context) (net.Conn, error)) probeURLResult {
 	latCtx, cancel := context.WithTimeout(ctx, probeURLTimeout)
 	defer cancel()
 
 	start := time.Now()
-	firstConn, err := proxy.DialContext(latCtx, &meta)
+	firstConn, err := dialFn(latCtx)
 	if err != nil {
 		return probeURLResult{Status: "error", Error: sanitizeProbeErr(err)}
 	}
@@ -664,8 +814,7 @@ func runProxyURLTest(ctx context.Context, proxy C.Proxy, targetURL *url.URL, met
 			if c != nil {
 				return c, nil
 			}
-			m := meta
-			return proxy.DialContext(dctx, &m)
+			return dialFn(dctx)
 		},
 		TLSClientConfig:       buildProxyTLSConfig(targetURL.Hostname()),
 		TLSHandshakeTimeout:   8 * time.Second,
@@ -735,7 +884,15 @@ func runProxyURLTest(ctx context.Context, proxy C.Proxy, targetURL *url.URL, met
 	}
 }
 
-func runProxySpeedTest(ctx context.Context, proxy C.Proxy, targetURL *url.URL, meta C.Metadata, maxBytes int64) probeSpeedResult {
+func runHTTPMultiStreamSpeedTest(
+	ctx context.Context,
+	targetURL *url.URL,
+	streams int,
+	warmupDur, steadyDur time.Duration,
+	maxCap int64,
+	steadyMode bool,
+	dialFn func(context.Context, string) (net.Conn, error),
+) probeSpeedResult {
 	select {
 	case speedSem <- struct{}{}:
 		defer func() { <-speedSem }()
@@ -743,111 +900,145 @@ func runProxySpeedTest(ctx context.Context, proxy C.Proxy, targetURL *url.URL, m
 		return probeSpeedResult{Status: "error", Error: "测速已取消"}
 	}
 
-	reqCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 
-	dialCtx, dialCancel := context.WithTimeout(reqCtx, probeSpeedDialTimeout)
-	conn, err := proxy.DialContext(dialCtx, &meta)
-	dialCancel()
-	if err != nil {
-		return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(err)}
+	var (
+		clockOnce   sync.Once
+		totalStart  time.Time
+		warmupEnd   time.Time
+		windowTimer *time.Timer
+
+		totalBytes  atomic.Int64
+		steadyBytes atomic.Int64
+
+		errMu    sync.Mutex
+		firstErr error
+	)
+	noteErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
 	}
 
-	var connOnce sync.Once
-	handed := false
+	startClock := func() {
+		clockOnce.Do(func() {
+			totalStart = time.Now()
+			warmupEnd = totalStart.Add(warmupDur)
+			windowTimer = time.AfterFunc(warmupDur+steadyDur, cancelRun)
+		})
+	}
 	defer func() {
-		if !handed {
-			_ = conn.Close()
+		if windowTimer != nil {
+			windowTimer.Stop()
 		}
 	}()
 
-	tr := &http.Transport{
-		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-			var c net.Conn
-			connOnce.Do(func() {
-				c = conn
-				handed = true
-			})
-			if c != nil {
-				return c, nil
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tr := &http.Transport{
+				DialContext: func(dctx context.Context, _, addr string) (net.Conn, error) {
+					return dialFn(dctx, addr)
+				},
+				TLSClientConfig:       buildProxyTLSConfig(""),
+				TLSHandshakeTimeout:   8 * time.Second,
+				ResponseHeaderTimeout: 8 * time.Second,
+				DisableCompression:    true,
+				ForceAttemptHTTP2:     false,
+				MaxIdleConnsPerHost:   1,
 			}
-			m := meta
-			return proxy.DialContext(dctx, &m)
-		},
-		TLSClientConfig:       buildProxyTLSConfig(targetURL.Hostname()),
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
-	}
-	client := &http.Client{Transport: tr}
-	defer client.CloseIdleConnections()
-
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL.String(), nil)
-	if err != nil {
-		return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(err)}
-	}
-	httpReq.Header.Set("User-Agent", "curl/8.5.0")
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(err)}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return probeSpeedResult{
-			Status: "error",
-			Error:  fmt.Sprintf("测速源返回 HTTP %d", resp.StatusCode),
-		}
-	}
-
-	// 从首包响应头到达后启动定长测量窗：到期主动 cancel 使阻塞 Read 立即收敛。
-	transferStart := time.Now()
-	timer := time.AfterFunc(probeSpeedTransferLimit, cancel)
-	defer timer.Stop()
-
-	buf := make([]byte, 64<<10)
-	var total int64
-	for total < maxBytes {
-		want := len(buf)
-		if rem := maxBytes - total; rem < int64(want) {
-			want = int(rem)
-		}
-		n, rerr := resp.Body.Read(buf[:want])
-		if n > 0 {
-			total += int64(n)
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) || (reqCtx.Err() != nil && ctx.Err() == nil && total > 0) {
-				break
+			client := &http.Client{
+				Transport: tr,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					if len(via) >= 5 {
+						return errors.New("测速地址重定向次数过多")
+					}
+					if _, _, verr := validateTargetHTTPURL(req.URL.String()); verr != nil {
+						return verr
+					}
+					return nil
+				},
 			}
-			if ctx.Err() != nil {
-				return probeSpeedResult{Status: "error", Error: "测速已取消"}
+			defer client.CloseIdleConnections()
+
+			buf := make([]byte, 128<<10)
+			for runCtx.Err() == nil {
+				httpReq, err := http.NewRequestWithContext(runCtx, http.MethodGet, targetURL.String(), nil)
+				if err != nil {
+					noteErr(err)
+					return
+				}
+				httpReq.Header.Set("User-Agent", "curl/8.5.0")
+
+				resp, err := client.Do(httpReq)
+				if err != nil {
+					if runCtx.Err() == nil {
+						noteErr(err)
+					}
+					return
+				}
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					_ = resp.Body.Close()
+					noteErr(fmt.Errorf("测速源返回 HTTP %d", resp.StatusCode))
+					return
+				}
+
+				startClock()
+				for {
+					n, rerr := resp.Body.Read(buf)
+					if n > 0 {
+						now := time.Now()
+						curTotal := totalBytes.Add(int64(n))
+						if !now.Before(warmupEnd) {
+							steadyBytes.Add(int64(n))
+						}
+						if curTotal >= maxCap {
+							cancelRun()
+							break
+						}
+					}
+					if rerr != nil {
+						break
+					}
+				}
+				_ = resp.Body.Close()
+				if !steadyMode {
+					return
+				}
 			}
-			if total == 0 {
-				return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(rerr)}
-			}
-			break
-		}
+		}()
 	}
-	if total == 0 {
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return probeSpeedResult{Status: "error", Error: "测速已取消"}
+	}
+	tot := totalBytes.Load()
+	if tot <= 0 {
+		if firstErr != nil {
+			return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(firstErr)}
+		}
 		return probeSpeedResult{Status: "error", Error: "测速源返回空响应"}
 	}
-	elapsed := time.Since(transferStart)
-	if elapsed < time.Millisecond {
-		elapsed = time.Millisecond
+
+	now := time.Now()
+	stBytes := steadyBytes.Load()
+	if steadyMode && warmupDur > 0 && stBytes > 0 && now.Sub(warmupEnd) >= 50*time.Millisecond {
+		res := formatPeerSpeedResult(stBytes, now.Sub(warmupEnd))
+		res.Streams = streams
+		return res
 	}
-	sec := elapsed.Seconds()
-	bps := int64(math.Round(float64(total) / sec))
-	mbps := math.Round((float64(total)*8)/(sec*1_000_000)*10) / 10
-	return probeSpeedResult{
-		Status:      "ok",
-		Bytes:       total,
-		DurationMs:  int(elapsed.Milliseconds()),
-		BytesPerSec: bps,
-		Mbps:        mbps,
-	}
+	res := formatPeerSpeedResult(tot, now.Sub(totalStart))
+	res.Streams = streams
+	return res
 }
 
 func runChainTCPProbe(ctx context.Context, host string, port int, token [32]byte, allowPrivate bool) probeChainResult {
@@ -858,22 +1049,7 @@ func runChainTCPProbe(ctx context.Context, host string, port int, token [32]byte
 	cctx, cancel := context.WithTimeout(ctx, probeChainTimeout)
 	defer cancel()
 
-	dialer := &net.Dialer{
-		Timeout: probeChainTimeout,
-		Control: func(_, address string, _ syscall.RawConn) error {
-			if allowPrivate {
-				return nil
-			}
-			h, _, err := parseDialTarget(address)
-			if err != nil {
-				return err
-			}
-			if forwardIPBlocked(net.ParseIP(h)) {
-				return errors.New("首跳地址不是公网地址")
-			}
-			return nil
-		},
-	}
+	dialer := newSafeTCPDialer(probeChainTimeout, allowPrivate, "首跳地址不是公网地址")
 	start := time.Now()
 	conn, err := dialer.DialContext(cctx, "tcp", target)
 	if err != nil {
@@ -977,4 +1153,918 @@ func sanitizeProbeErr(err error) string {
 		return "连接失败"
 	}
 	return text
+}
+
+const (
+	peerTCPMagic     = "NWDPEER1"
+	peerUDPMagic     = "NWDPEERU"
+	peerHeaderBytes  = 8 + 1 + 32 + 8 + 4
+	peerUDPPktBytes  = 8 + 32 + 8
+	peerMaxActiveSrv = 4
+	peerMaxTTL       = 45 * time.Second
+	peerStreamLimit  = 20 * time.Second
+)
+
+var (
+	peerRandOnce sync.Once
+	peerRandBuf  [256 << 10]byte
+
+	peerSrvMu      sync.Mutex
+	activePeerSrvs = map[string]*peerServer{}
+)
+
+func peerPayloadChunk() []byte {
+	peerRandOnce.Do(func() {
+		if _, err := rand.Read(peerRandBuf[:]); err != nil {
+			for i := range peerRandBuf {
+				peerRandBuf[i] = byte(i*31 + 17)
+			}
+		}
+	})
+	return peerRandBuf[:]
+}
+
+type peerServer struct {
+	id        string
+	token     [32]byte
+	tcpLn     net.Listener
+	udpConn   net.PacketConn
+	closeOnce sync.Once
+	timer     *time.Timer
+
+	connsMu sync.Mutex
+	stopped bool
+	conns   map[net.Conn]struct{}
+}
+
+func (ps *peerServer) trackConn(c net.Conn) bool {
+	ps.connsMu.Lock()
+	defer ps.connsMu.Unlock()
+	if ps.stopped {
+		return false
+	}
+	if ps.conns == nil {
+		ps.conns = map[net.Conn]struct{}{}
+	}
+	ps.conns[c] = struct{}{}
+	return true
+}
+
+func (ps *peerServer) untrackConn(c net.Conn) {
+	ps.connsMu.Lock()
+	delete(ps.conns, c)
+	ps.connsMu.Unlock()
+}
+
+func (ps *peerServer) stop() {
+	ps.closeOnce.Do(func() {
+		if ps.timer != nil {
+			ps.timer.Stop()
+		}
+		if ps.tcpLn != nil {
+			_ = ps.tcpLn.Close()
+		}
+		if ps.udpConn != nil {
+			_ = ps.udpConn.Close()
+		}
+		ps.connsMu.Lock()
+		ps.stopped = true
+		active := make([]net.Conn, 0, len(ps.conns))
+		for c := range ps.conns {
+			active = append(active, c)
+		}
+		ps.conns = nil
+		ps.connsMu.Unlock()
+		for _, c := range active {
+			_ = c.Close()
+		}
+		peerSrvMu.Lock()
+		if activePeerSrvs[ps.id] == ps {
+			delete(activePeerSrvs, ps.id)
+		}
+		peerSrvMu.Unlock()
+	})
+}
+
+func stopPeerServerByID(id string) {
+	if id == "" {
+		return
+	}
+	peerSrvMu.Lock()
+	ps := activePeerSrvs[id]
+	peerSrvMu.Unlock()
+	if ps != nil {
+		ps.stop()
+	}
+}
+
+func (s *session) handlePeerStop(raw json.RawMessage) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
+		return
+	}
+	stopPeerServerByID(req.ID)
+}
+
+func (s *session) handlePeerServeReq(ctx context.Context, raw json.RawMessage) {
+	var req struct {
+		ID         string `json:"id"`
+		ListenHost string `json:"listen_host"`
+		Port       int    `json:"port"`
+		TokenHex   string `json:"token_hex"`
+		TTLMs      int    `json:"ttl_ms"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ID == "" {
+		return
+	}
+	reply := func(payload map[string]any) {
+		rawRes, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		if err := s.send(ctx, message{T: msgPeerServeResp, D: rawRes}); err != nil {
+			logf(levelWarning, "%s", err.Error())
+		}
+	}
+
+	tokBytes, err := hex.DecodeString(strings.TrimSpace(req.TokenHex))
+	if err != nil || len(tokBytes) != 32 {
+		reply(map[string]any{"id": req.ID, "ok": false, "error": "invalid peer token"})
+		return
+	}
+	if req.Port < 0 || req.Port > 65535 {
+		reply(map[string]any{"id": req.ID, "ok": false, "error": "invalid peer port"})
+		return
+	}
+
+	peerSrvMu.Lock()
+	if old := activePeerSrvs[req.ID]; old != nil {
+		peerSrvMu.Unlock()
+		old.stop()
+		peerSrvMu.Lock()
+	}
+	if len(activePeerSrvs) >= peerMaxActiveSrv {
+		peerSrvMu.Unlock()
+		reply(map[string]any{"id": req.ID, "ok": false, "error": "目标机器当前并发测试已满，请稍后重试"})
+		return
+	}
+	peerSrvMu.Unlock()
+
+	listenHost := strings.TrimSpace(req.ListenHost)
+	bindAddr := net.JoinHostPort(listenHost, strconv.Itoa(req.Port))
+	tcpLn, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		reply(map[string]any{"id": req.ID, "ok": false, "error": sanitizeProbeErr(err)})
+		return
+	}
+	actualPort := req.Port
+	if tcpAddr, ok := tcpLn.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+		actualPort = tcpAddr.Port
+	}
+
+	udpConn, udpErr := net.ListenPacket("udp", net.JoinHostPort(listenHost, strconv.Itoa(actualPort)))
+	udpOK := udpErr == nil
+
+	ttl := time.Duration(req.TTLMs) * time.Millisecond
+	if ttl <= 0 || ttl > peerMaxTTL {
+		ttl = 35 * time.Second
+	}
+	ps := &peerServer{
+		id:      req.ID,
+		tcpLn:   tcpLn,
+		udpConn: udpConn,
+		conns:   map[net.Conn]struct{}{},
+	}
+	copy(ps.token[:], tokBytes)
+
+	peerSrvMu.Lock()
+	if old := activePeerSrvs[req.ID]; old != nil {
+		// 并发同 ID 竞争时先替换占位，再在锁外关闭旧实例，避免覆盖泄漏。
+		delete(activePeerSrvs, req.ID)
+		peerSrvMu.Unlock()
+		old.stop()
+		peerSrvMu.Lock()
+	}
+	if len(activePeerSrvs) >= peerMaxActiveSrv {
+		peerSrvMu.Unlock()
+		_ = tcpLn.Close()
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+		reply(map[string]any{"id": req.ID, "ok": false, "error": "目标机器当前并发测试已满，请稍后重试"})
+		return
+	}
+	ps.timer = time.AfterFunc(ttl, ps.stop)
+	activePeerSrvs[req.ID] = ps
+	peerSrvMu.Unlock()
+
+	go ps.serveTCP()
+	if udpOK {
+		go ps.serveUDP()
+	}
+
+	reply(map[string]any{
+		"id":     req.ID,
+		"ok":     true,
+		"port":   actualPort,
+		"udp_ok": udpOK,
+	})
+}
+
+func (ps *peerServer) serveTCP() {
+	sem := make(chan struct{}, 24)
+	for {
+		conn, err := ps.tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		if !ps.trackConn(conn) {
+			_ = conn.Close()
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			go func(c net.Conn) {
+				defer func() {
+					<-sem
+					ps.untrackConn(c)
+					_ = c.Close()
+				}()
+				ps.handleTCPConn(c)
+			}(conn)
+		default:
+			ps.untrackConn(conn)
+			_ = conn.Close()
+		}
+	}
+}
+
+func (ps *peerServer) handleTCPConn(conn net.Conn) {
+	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+	var hdr [peerHeaderBytes]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		// TCPing 握手后直接关闭会命中 EOF，静默结束即可。
+		return
+	}
+	if string(hdr[:8]) != peerTCPMagic {
+		return
+	}
+	if subtle.ConstantTimeCompare(hdr[9:41], ps.token[:]) != 1 {
+		return
+	}
+	mode := hdr[8]
+	if mode == 'P' {
+		_, _ = conn.Write([]byte("NWDPEER_PONG\n"))
+		return
+	}
+
+	size := int64(binary.BigEndian.Uint64(hdr[41:49]))
+	if size <= 0 || size > probeSteadyMaxBytes {
+		size = probeSteadyMaxBytes
+	}
+	warmupMs := int(binary.BigEndian.Uint32(hdr[49:53]))
+	if warmupMs < 0 {
+		warmupMs = 0
+	}
+	if warmupMs > probeMaxWarmupMs {
+		warmupMs = probeMaxWarmupMs
+	}
+	_ = conn.SetDeadline(time.Now().Add(peerStreamLimit + 4*time.Second))
+
+	switch mode {
+	case 'D':
+		// 目标机器 → 发起机器（接收/下行极限测速）
+		if _, err := conn.Write([]byte("NWDPEER_OK\n")); err != nil {
+			return
+		}
+		chunk := peerPayloadChunk()
+		deadline := time.Now().Add(peerStreamLimit)
+		var sent int64
+		for sent < size && time.Now().Before(deadline) {
+			step := int64(len(chunk))
+			if rem := size - sent; rem < step {
+				step = rem
+			}
+			n, werr := conn.Write(chunk[:step])
+			if n > 0 {
+				sent += int64(n)
+			}
+			if werr != nil {
+				return
+			}
+		}
+	case 'U':
+		// 发起机器 → 目标机器（发送/上行极限测速，由对端剔除预热后如实统计接收速率）
+		if _, err := conn.Write([]byte("NWDPEER_READY\n")); err != nil {
+			return
+		}
+		buf := make([]byte, 256<<10)
+		var (
+			received    int64
+			steadyRx    int64
+			measureFrom time.Time
+			warmupEnd   time.Time
+		)
+		warmupDur := time.Duration(warmupMs) * time.Millisecond
+		deadline := time.Now().Add(peerStreamLimit)
+		for received < size && time.Now().Before(deadline) {
+			step := int64(len(buf))
+			if rem := size - received; rem < step {
+				step = rem
+			}
+			n, rerr := conn.Read(buf[:step])
+			if n > 0 {
+				now := time.Now()
+				if measureFrom.IsZero() {
+					measureFrom = now
+					warmupEnd = now.Add(warmupDur)
+				}
+				received += int64(n)
+				if !now.Before(warmupEnd) {
+					steadyRx += int64(n)
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		endAt := time.Now()
+		durMs := int(endAt.Sub(measureFrom).Milliseconds())
+		if measureFrom.IsZero() || durMs < 1 {
+			durMs = 1
+		}
+		steadyMs := 0
+		if !measureFrom.IsZero() && endAt.After(warmupEnd) {
+			steadyMs = int(endAt.Sub(warmupEnd).Milliseconds())
+		}
+		_, _ = fmt.Fprintf(conn, "NWDPEER_DONE:%d:%d:%d:%d\n", received, durMs, steadyRx, steadyMs)
+	}
+}
+
+func (ps *peerServer) serveUDP() {
+	buf := make([]byte, 256)
+	for {
+		n, addr, err := ps.udpConn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n != peerUDPPktBytes || string(buf[:8]) != peerUDPMagic {
+			continue
+		}
+		if subtle.ConstantTimeCompare(buf[8:40], ps.token[:]) != 1 {
+			continue
+		}
+		var reply [20]byte
+		copy(reply[:12], "NWDPEERU_OK:")
+		copy(reply[12:20], buf[40:48])
+		_, _ = ps.udpConn.WriteTo(reply[:], addr)
+	}
+}
+
+func runPeerProbe(ctx context.Context, req probeRequest, host string, resp *probeResponse) {
+	tokBytes, err := hex.DecodeString(strings.TrimSpace(req.PeerToken))
+	if err != nil || len(tokBytes) != 32 {
+		resp.Error = "机器互测令牌无效"
+		return
+	}
+	var tok [32]byte
+	copy(tok[:], tokBytes)
+
+	if req.PeerTCP {
+		tcpRes := runPeerTCPProbe(ctx, host, req.Port, tok, req.AllowPrivate)
+		resp.PeerTCP = &tcpRes
+	}
+	if req.PeerUDP {
+		udpRes := runPeerUDPProbe(ctx, host, req.Port, tok, req.AllowPrivate)
+		resp.PeerUDP = &udpRes
+	} else {
+		resp.PeerUDP = &probePingResult{Status: "skipped", Error: "未启用 UDP"}
+	}
+
+	if !req.PeerSpeed {
+		resp.PeerSend = &probeSpeedResult{Status: "skipped"}
+		resp.PeerRecv = &probeSpeedResult{Status: "skipped"}
+		return
+	}
+
+	if (resp.PeerTCP != nil && resp.PeerTCP.Status != "ok") || (resp.PeerTCP == nil && resp.TCPing != nil && resp.TCPing.Status != "ok") {
+		skipMsg := "链内 TCP 未连通，已跳过测速"
+		resp.PeerSend = &probeSpeedResult{Status: "skipped", Error: skipMsg}
+		resp.PeerRecv = &probeSpeedResult{Status: "skipped", Error: skipMsg}
+		return
+	}
+
+	select {
+	case speedSem <- struct{}{}:
+		defer func() { <-speedSem }()
+	case <-ctx.Done():
+		resp.PeerSend = &probeSpeedResult{Status: "error", Error: "测试已取消"}
+		resp.PeerRecv = &probeSpeedResult{Status: "error", Error: "测试已取消"}
+		return
+	}
+
+	streams, warmupDur, steadyDur, maxCap, steadyMode := resolveSpeedParams(req)
+	dir := strings.ToLower(strings.TrimSpace(req.PeerDir))
+	if dir == "" {
+		dir = "both"
+	}
+	if dir == "both" || dir == "send" {
+		sendRes := runPeerMultiStreamSend(ctx, host, req.Port, tok, streams, warmupDur, steadyDur, maxCap, steadyMode, req.AllowPrivate)
+		resp.PeerSend = &sendRes
+	} else {
+		resp.PeerSend = &probeSpeedResult{Status: "skipped", Error: "未选择发送方向"}
+	}
+	if ctx.Err() != nil {
+		if resp.PeerRecv == nil {
+			resp.PeerRecv = &probeSpeedResult{Status: "error", Error: "测试已取消"}
+		}
+		return
+	}
+	if dir == "both" || dir == "recv" {
+		recvRes := runPeerMultiStreamRecv(ctx, host, req.Port, tok, streams, warmupDur, steadyDur, maxCap, steadyMode, req.AllowPrivate)
+		resp.PeerRecv = &recvRes
+	} else {
+		resp.PeerRecv = &probeSpeedResult{Status: "skipped", Error: "未选择接收方向"}
+	}
+}
+
+func runPeerTCPProbe(ctx context.Context, host string, port int, token [32]byte, allowPrivate bool) probePingResult {
+	if port < 1 || port > 65535 {
+		return probePingResult{Status: "error", LossPct: 100, Error: "端口无效"}
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := newSafeTCPDialer(probeTCPTimeout, allowPrivate, "目标地址不是公网地址")
+	hdr := buildPeerTCPHeader('P', token, 0, 0)
+
+	var samples []int
+	var lastErr error
+	for i := 0; i < defaultProbePingCount; i++ {
+		if ctx.Err() != nil {
+			break
+		}
+		start := time.Now()
+		dctx, cancel := context.WithTimeout(ctx, probeTCPTimeout)
+		conn, derr := dialer.DialContext(dctx, "tcp", target)
+		cancel()
+		if derr != nil {
+			lastErr = derr
+		} else {
+			_ = conn.SetDeadline(time.Now().Add(probeTCPTimeout))
+			if _, werr := conn.Write(hdr[:]); werr != nil {
+				lastErr = werr
+			} else {
+				br := bufio.NewReaderSize(conn, 64)
+				line, rerr := br.ReadString('\n')
+				if rerr != nil {
+					lastErr = rerr
+				} else if strings.TrimSpace(line) == "NWDPEER_PONG" {
+					ms := int(time.Since(start).Milliseconds())
+					if ms < 1 {
+						ms = 1
+					}
+					samples = append(samples, ms)
+				} else {
+					lastErr = errors.New("未收到链内握手回包")
+				}
+			}
+			_ = conn.Close()
+		}
+		if i+1 < defaultProbePingCount {
+			sleep(ctx, probeTCPInterval)
+		}
+	}
+	return summarizePingSamples(samples, defaultProbePingCount, lastErr)
+}
+
+func runPeerUDPProbe(ctx context.Context, host string, port int, token [32]byte, allowPrivate bool) probePingResult {
+	if port < 1 || port > 65535 {
+		return probePingResult{Status: "error", LossPct: 100, Error: "端口无效"}
+	}
+	ip, err := resolveProbeIP(ctx, host, allowPrivate)
+	if err != nil {
+		return probePingResult{Status: "error", LossPct: 100, Error: sanitizeProbeErr(err)}
+	}
+	network := "udp4"
+	if ip.To4() == nil {
+		network = "udp6"
+	}
+	conn, err := net.DialUDP(network, nil, &net.UDPAddr{IP: ip, Port: port})
+	if err != nil {
+		return probePingResult{Status: "error", LossPct: 100, Error: sanitizeProbeErr(err)}
+	}
+	defer conn.Close()
+
+	var samples []int
+	var lastErr error
+	rx := make([]byte, 128)
+	for i := 0; i < defaultProbePingCount; i++ {
+		if ctx.Err() != nil {
+			break
+		}
+		var nonce [8]byte
+		_, _ = rand.Read(nonce[:])
+		var pkt [peerUDPPktBytes]byte
+		copy(pkt[:8], peerUDPMagic)
+		copy(pkt[8:40], token[:])
+		copy(pkt[40:48], nonce[:])
+
+		start := time.Now()
+		deadline := start.Add(probeICMPTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+		_ = conn.SetDeadline(deadline)
+		if _, werr := conn.Write(pkt[:]); werr != nil {
+			lastErr = werr
+		} else {
+			n, rerr := conn.Read(rx)
+			if rerr != nil {
+				lastErr = rerr
+			} else if n == 20 && string(rx[:12]) == "NWDPEERU_OK:" && bytes.Equal(rx[12:20], nonce[:]) {
+				ms := int(time.Since(start).Milliseconds())
+				if ms < 1 {
+					ms = 1
+				}
+				samples = append(samples, ms)
+			}
+		}
+		if i+1 < defaultProbePingCount {
+			select {
+			case <-ctx.Done():
+			case <-time.After(probeTCPInterval):
+			}
+		}
+	}
+	return summarizePingSamples(samples, defaultProbePingCount, lastErr)
+}
+
+func dialPeerTCP(ctx context.Context, host string, port int, allowPrivate bool) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, probeSpeedDialTimeout)
+	defer cancel()
+	d := newSafeTCPDialer(probeSpeedDialTimeout, allowPrivate, "目标地址不是公网地址")
+	return d.DialContext(dialCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+}
+
+func buildPeerTCPHeader(mode byte, token [32]byte, sizeBytes int64, warmupMs uint32) [peerHeaderBytes]byte {
+	var hdr [peerHeaderBytes]byte
+	copy(hdr[:8], peerTCPMagic)
+	hdr[8] = mode
+	copy(hdr[9:41], token[:])
+	binary.BigEndian.PutUint64(hdr[41:49], uint64(sizeBytes))
+	binary.BigEndian.PutUint32(hdr[49:53], warmupMs)
+	return hdr
+}
+
+func runPeerMultiStreamRecv(
+	ctx context.Context,
+	host string,
+	port int,
+	token [32]byte,
+	streams int,
+	warmupDur, steadyDur time.Duration,
+	maxCap int64,
+	steadyMode bool,
+	allowPrivate bool,
+) probeSpeedResult {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	perStreamCap := maxCap
+	if steadyMode && streams > 1 {
+		perStreamCap = maxCap / int64(streams)
+		if perStreamCap < (64 << 20) {
+			perStreamCap = 64 << 20
+		}
+	}
+	warmupMs := uint32(warmupDur.Milliseconds())
+
+	var (
+		clockOnce   sync.Once
+		totalStart  time.Time
+		warmupEnd   time.Time
+		windowTimer *time.Timer
+
+		totalBytes  atomic.Int64
+		steadyBytes atomic.Int64
+
+		errMu    sync.Mutex
+		firstErr error
+	)
+	noteErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+	}
+	startClock := func() {
+		clockOnce.Do(func() {
+			totalStart = time.Now()
+			warmupEnd = totalStart.Add(warmupDur)
+			windowTimer = time.AfterFunc(warmupDur+steadyDur, cancelRun)
+		})
+	}
+	defer func() {
+		if windowTimer != nil {
+			windowTimer.Stop()
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := dialPeerTCP(runCtx, host, port, allowPrivate)
+			if err != nil {
+				if runCtx.Err() == nil {
+					noteErr(err)
+				}
+				return
+			}
+			stopOnCancel := context.AfterFunc(runCtx, func() { _ = conn.Close() })
+			defer func() {
+				stopOnCancel()
+				_ = conn.Close()
+			}()
+
+			_ = conn.SetDeadline(time.Now().Add(peerStreamLimit + 4*time.Second))
+			hdr := buildPeerTCPHeader('D', token, perStreamCap, warmupMs)
+			if _, err := conn.Write(hdr[:]); err != nil {
+				if runCtx.Err() == nil {
+					noteErr(err)
+				}
+				return
+			}
+
+			br := bufio.NewReaderSize(conn, 256<<10)
+			line, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(line) != "NWDPEER_OK" {
+				if runCtx.Err() == nil {
+					noteErr(errors.New("目标机器未确认测速握手"))
+				}
+				return
+			}
+
+			startClock()
+			buf := make([]byte, 256<<10)
+			for {
+				n, rerr := br.Read(buf)
+				if n > 0 {
+					now := time.Now()
+					curTotal := totalBytes.Add(int64(n))
+					if !now.Before(warmupEnd) {
+						steadyBytes.Add(int64(n))
+					}
+					if curTotal >= maxCap {
+						cancelRun()
+						return
+					}
+				}
+				if rerr != nil {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return probeSpeedResult{Status: "error", Error: "测速已取消"}
+	}
+	tot := totalBytes.Load()
+	if tot <= 0 {
+		if firstErr != nil {
+			return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(firstErr)}
+		}
+		return probeSpeedResult{Status: "error", Error: "未收到对端测速数据"}
+	}
+
+	now := time.Now()
+	stBytes := steadyBytes.Load()
+	if steadyMode && warmupDur > 0 && stBytes > 0 && now.Sub(warmupEnd) >= 50*time.Millisecond {
+		res := formatPeerSpeedResult(stBytes, now.Sub(warmupEnd))
+		res.Streams = streams
+		return res
+	}
+	res := formatPeerSpeedResult(tot, now.Sub(totalStart))
+	res.Streams = streams
+	return res
+}
+
+func runPeerMultiStreamSend(
+	ctx context.Context,
+	host string,
+	port int,
+	token [32]byte,
+	streams int,
+	warmupDur, steadyDur time.Duration,
+	maxCap int64,
+	steadyMode bool,
+	allowPrivate bool,
+) probeSpeedResult {
+	sendCtx, stopSending := context.WithCancel(ctx)
+	defer stopSending()
+
+	perStreamCap := maxCap
+	if steadyMode && streams > 1 {
+		perStreamCap = maxCap / int64(streams)
+		if perStreamCap < (64 << 20) {
+			perStreamCap = 64 << 20
+		}
+	}
+	warmupMs := uint32(warmupDur.Milliseconds())
+	chunk := peerPayloadChunk()
+
+	var (
+		clockOnce   sync.Once
+		totalStart  time.Time
+		windowTimer *time.Timer
+
+		sentTotal   atomic.Int64
+		rxTotalSum  atomic.Int64
+		rxSteadySum atomic.Int64
+		rxMaxTotal  atomic.Int64
+		rxMaxSteady atomic.Int64
+
+		errMu    sync.Mutex
+		firstErr error
+	)
+	noteErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+	}
+	startClock := func() {
+		clockOnce.Do(func() {
+			totalStart = time.Now()
+			windowTimer = time.AfterFunc(warmupDur+steadyDur, stopSending)
+		})
+	}
+	defer func() {
+		if windowTimer != nil {
+			windowTimer.Stop()
+		}
+	}()
+
+	updateMax := func(dst *atomic.Int64, val int64) {
+		for {
+			cur := dst.Load()
+			if val <= cur || dst.CompareAndSwap(cur, val) {
+				return
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := dialPeerTCP(sendCtx, host, port, allowPrivate)
+			if err != nil {
+				if sendCtx.Err() == nil {
+					noteErr(err)
+				}
+				return
+			}
+			abortOnUserCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer func() {
+				abortOnUserCancel()
+				_ = conn.Close()
+			}()
+
+			_ = conn.SetDeadline(time.Now().Add(peerStreamLimit + 4*time.Second))
+			hdr := buildPeerTCPHeader('U', token, perStreamCap, warmupMs)
+			if _, err := conn.Write(hdr[:]); err != nil {
+				if sendCtx.Err() == nil {
+					noteErr(err)
+				}
+				return
+			}
+
+			br := bufio.NewReaderSize(conn, 4096)
+			line, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(line) != "NWDPEER_READY" {
+				if sendCtx.Err() == nil {
+					noteErr(errors.New("目标机器未就绪接收测速"))
+				}
+				return
+			}
+
+			startClock()
+			// 当定时窗口结束（sendCtx 取消）时打断阻塞 Write，以便进入半关闭读取对端真实收包统计。
+			unblockWrite := context.AfterFunc(sendCtx, func() {
+				_ = conn.SetWriteDeadline(time.Now())
+			})
+			var streamSent int64
+			for streamSent < perStreamCap && sendCtx.Err() == nil {
+				step := int64(len(chunk))
+				if rem := perStreamCap - streamSent; rem < step {
+					step = rem
+				}
+				n, werr := conn.Write(chunk[:step])
+				if n > 0 {
+					streamSent += int64(n)
+					if sentTotal.Add(int64(n)) >= maxCap {
+						stopSending()
+						break
+					}
+				}
+				if werr != nil {
+					break
+				}
+			}
+			unblockWrite()
+			if ctx.Err() != nil {
+				return
+			}
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.CloseWrite()
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+			doneLine, rerr := br.ReadString('\n')
+			if rerr == nil {
+				if rest, ok := strings.CutPrefix(strings.TrimSpace(doneLine), "NWDPEER_DONE:"); ok {
+					parts := strings.Split(rest, ":")
+					if len(parts) >= 2 {
+						rxB, bErr := strconv.ParseInt(parts[0], 10, 64)
+						rxMs, mErr := strconv.ParseInt(parts[1], 10, 64)
+						if bErr == nil && mErr == nil && rxB > 0 {
+							rxTotalSum.Add(rxB)
+							updateMax(&rxMaxTotal, rxMs)
+						}
+					}
+					if len(parts) >= 4 {
+						stB, bErr := strconv.ParseInt(parts[2], 10, 64)
+						stMs, mErr := strconv.ParseInt(parts[3], 10, 64)
+						if bErr == nil && mErr == nil && stB > 0 {
+							rxSteadySum.Add(stB)
+							updateMax(&rxMaxSteady, stMs)
+						}
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return probeSpeedResult{Status: "error", Error: "测速已取消"}
+	}
+
+	now := time.Now()
+	if steadyMode && warmupDur > 0 && rxSteadySum.Load() > 0 && rxMaxSteady.Load() >= 50 {
+		dur := time.Duration(rxMaxSteady.Load()) * time.Millisecond
+		res := formatPeerSpeedResult(rxSteadySum.Load(), dur)
+		res.Streams = streams
+		return res
+	}
+	if rxTotalSum.Load() > 0 {
+		dur := time.Duration(rxMaxTotal.Load()) * time.Millisecond
+		if localDur := now.Sub(totalStart); localDur > dur {
+			dur = localDur
+		}
+		res := formatPeerSpeedResult(rxTotalSum.Load(), dur)
+		res.Streams = streams
+		return res
+	}
+	if sentTotal.Load() > 0 {
+		res := formatPeerSpeedResult(sentTotal.Load(), now.Sub(totalStart))
+		res.Streams = streams
+		return res
+	}
+	if firstErr != nil {
+		return probeSpeedResult{Status: "error", Error: sanitizeProbeErr(firstErr)}
+	}
+	return probeSpeedResult{Status: "error", Error: "发送测速未传出数据"}
+}
+
+func formatPeerSpeedResult(totalBytes int64, dur time.Duration) probeSpeedResult {
+	if dur < time.Millisecond {
+		dur = time.Millisecond
+	}
+	durMs := int(dur.Milliseconds())
+	if durMs < 1 {
+		durMs = 1
+	}
+	bps := int64(float64(totalBytes) / dur.Seconds())
+	mbps := math.Round((float64(bps)*8.0/1_000_000.0)*10) / 10
+	return probeSpeedResult{
+		Status:      "ok",
+		Bytes:       totalBytes,
+		DurationMs:  durMs,
+		BytesPerSec: bps,
+		Mbps:        mbps,
+	}
 }

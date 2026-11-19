@@ -59,18 +59,23 @@ const (
 	msgProbeCancel   = "probe_cancel"
 	msgProbeArm      = "probe_arm"
 	msgProbeArmResp  = "probe_arm_resp"
+	msgPeerServeReq  = "peer_serve_req"
+	msgPeerServeResp = "peer_serve_resp"
+	msgPeerStop      = "peer_stop"
 )
 
 // featureForwardV1 声明 agent 支持独立转发（desired.forwards、per-forward 计数）；
 // featureProbeV1 声明 agent 支持节点端到端测试与转发链整链贯穿探测；
+// featurePeerProbeV1 声明 agent 支持机器间端到端互测（临时鉴权监听、UDP 往返与双向点对点测速）；
 // 随 desired_req 与 heartbeat 上报，旧面板忽略未知字段。
 const (
-	featureForwardV1 = "forward-v1"
-	featureProbeV1   = "probe-v1"
+	featureForwardV1   = "forward-v1"
+	featureProbeV1     = "probe-v1"
+	featurePeerProbeV1 = "peer-probe-v1"
 )
 
 // channelFeatures 是 agent 能力声明，字段追加只增不删。
-var channelFeatures = []string{featureForwardV1, featureProbeV1}
+var channelFeatures = []string{featureForwardV1, featureProbeV1, featurePeerProbeV1}
 
 // message 是握手后每个 binary 帧的明文：紧凑 JSON {"t":"<type>","d":<任意 JSON>}。
 type message struct {
@@ -456,6 +461,10 @@ func (s *session) serve(ctx context.Context) error {
 				s.handleProbeCancel(frame.msg.D)
 			case msgProbeArm:
 				s.handleProbeArm(ctx, frame.msg.D)
+			case msgPeerServeReq:
+				go s.handlePeerServeReq(ctx, frame.msg.D)
+			case msgPeerStop:
+				s.handlePeerStop(frame.msg.D)
 			}
 		}
 	}
