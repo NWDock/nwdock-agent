@@ -133,6 +133,36 @@ func TestMeterCloseInboundUsers(t *testing.T) {
 	}
 }
 
+func TestMeterSignalThrottle(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	m := testMeter(&now)
+
+	m.signal()
+	select {
+	case <-m.wake:
+	default:
+		t.Fatal("first signal must enqueue wake")
+	}
+
+	// 节流窗口内（小于 statsNudgeMin）不重复唤醒。
+	now = now.Add(statsNudgeMin - time.Millisecond)
+	m.signal()
+	select {
+	case <-m.wake:
+		t.Fatal("signal inside statsNudgeMin window must be throttled")
+	default:
+	}
+
+	// 越过 statsNudgeMin 后放行下一次唤醒。
+	now = now.Add(time.Millisecond)
+	m.signal()
+	select {
+	case <-m.wake:
+	default:
+		t.Fatal("signal at statsNudgeMin boundary must enqueue wake")
+	}
+}
+
 type closeProbe struct{ closed bool }
 
 func (c *closeProbe) Read([]byte) (int, error)  { return 0, io.EOF }

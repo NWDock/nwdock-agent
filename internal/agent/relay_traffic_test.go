@@ -213,3 +213,65 @@ func TestMergeRelayCounters(t *testing.T) {
 		t.Fatalf("core value must win: %+v", got)
 	}
 }
+
+func drainTrafficWake() {
+	traffic.mu.Lock()
+	traffic.lastSignal = time.Time{}
+	traffic.mu.Unlock()
+	for {
+		select {
+		case <-traffic.wake:
+		default:
+			return
+		}
+	}
+}
+
+// TestRelayNormalCloseDoesNotWakeStatsAndRevokeWakes 常规 TCP 连接关闭不唤醒 stats 上报
+// （避免高并发短连接打成 500ms 统计风暴），仅在撤销/退休条目时唤醒一次冲刷尾量。
+func TestRelayNormalCloseDoesNotWakeStatsAndRevokeWakes(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	resetRelayBytes()
+	resetForwardBytes()
+	t.Cleanup(func() {
+		relayStop()
+		resetForwardBytes()
+		drainTrafficWake()
+	})
+
+	sink := echoSink(t)
+	entry := freePort(t)
+	if err := relayApplyAll(dir, nil, []relaySpec{fwdSpec("fwake", entry, sink, true, false, true)}); err != nil {
+		t.Fatal(err)
+	}
+	waitForwardListening(t, "fwake")
+	drainTrafficWake()
+
+	// 常规连接建立、收发、关闭：不应触发 traffic.wake。
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoThrough(t, conn, "hello-relay")
+	_ = conn.Close()
+	if got := waitRelayCounter(t, "relay>>>all>>>traffic>>>uplink", int64(len("hello-relay"))); got != int64(len("hello-relay")) {
+		t.Fatalf("uplink %d", got)
+	}
+	// 等一会确保 handleTCP 的 defer 全部走完。
+	select {
+	case <-traffic.wake:
+		t.Fatal("normal TCP close must not wake stats immediately")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// 撤销转发条目：应立即唤醒一次 stats 以冲刷尾量并退休计数。
+	if err := relayApplyAll(dir, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-traffic.wake:
+	case <-time.After(time.Second):
+		t.Fatal("revoking forward must wake stats to flush tail bytes")
+	}
+}

@@ -152,7 +152,8 @@ func relayNoteTo(fwd string, n int64, upload bool) {
 	}
 }
 
-// relayWakeStats 在连接/会话结束后唤醒合并上报；字节已实时入账，这里不再加尾量。
+// relayWakeStats 在转发条目撤销/退休后唤醒一次合并上报，尽快冲刷尾量并让 retired 计数退休；
+// 常规数据面连接结束不再高频唤醒，随 60s statsInterval 周期上报（与代理核心一致）。
 func relayWakeStats() {
 	traffic.signal()
 }
@@ -638,25 +639,35 @@ func (e *relayEngine) retryFailed() {
 // apply 只收敛 legacy 清单，不触碰独立转发：旧面板的 desired 没有 forwards 段。
 func (e *relayEngine) apply(legacy []relaySpec) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.applyLegacyLocked(legacy)
+	wake, err := e.applyLegacyLocked(legacy)
+	e.mu.Unlock()
+	if err == nil && wake {
+		relayWakeStats()
+	}
+	return err
 }
 
 // applyAll 同时收敛 legacy 与独立转发。任一份清单落盘失败就整体返回错误：
 // 调用方据此不确认世代，面板下一轮重推，运行时保持上一份已验证的清单。
 func (e *relayEngine) applyAll(legacy, forwards []relaySpec) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.applyLegacyLocked(legacy); err != nil {
+	wakeLegacy, err := e.applyLegacyLocked(legacy)
+	if err != nil {
+		e.mu.Unlock()
 		return err
 	}
-	return e.applyForwardsLocked(forwards)
+	wakeForwards, err := e.applyForwardsLocked(forwards)
+	e.mu.Unlock()
+	if err == nil && (wakeLegacy || wakeForwards) {
+		relayWakeStats()
+	}
+	return err
 }
 
 // isForward 报告 handle 属于哪个域：独立转发按 forward id 收敛，legacy 按入口端口。
 func (h *relayHandle) isForward() bool { return h.spec.ForwardID != "" }
 
-func (e *relayEngine) applyLegacyLocked(specs []relaySpec) error {
+func (e *relayEngine) applyLegacyLocked(specs []relaySpec) (bool, error) {
 	want := map[string]relaySpec{}
 	for _, sp := range specs {
 		if sp.ForwardID != "" || !sp.valid() {
@@ -669,13 +680,12 @@ func (e *relayEngine) applyLegacyLocked(specs []relaySpec) error {
 	}
 	// 先落盘再切运行时：落盘失败时运行中的清单不动，调用方不确认世代。
 	if err := e.persistWantLocked(&e.persist, want, writeRelayWant); err != nil {
-		return err
+		return false, err
 	}
-	e.reconcileLocked(false, want)
-	return nil
+	return e.reconcileLocked(false, want), nil
 }
 
-func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) error {
+func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) (bool, error) {
 	want := map[string]relaySpec{}
 	for _, sp := range forwards {
 		if !sp.validForward() {
@@ -689,13 +699,15 @@ func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) error {
 	}
 	// 先落盘再切运行时：落盘失败时运行中的清单不动，调用方不确认世代。
 	if err := e.persistWantLocked(&e.fwdPersist, want, writeForwardWant); err != nil {
-		return err
+		return false, err
 	}
 	// 本批消失的 id 进退休队列：累计计数保留到面板 stats_ack 确认后才丢，
 	// 否则删除前最后一笔字节会随条目一起蒸发。重新启用的 id 从退休队列摘除。
+	retired := false
 	for id := range e.liveForwards {
 		if _, ok := want[relayForwardKey(id)]; !ok {
 			e.retiredForwards[id] = true
+			retired = true
 		}
 	}
 	e.liveForwards = make(map[string]bool, len(want))
@@ -703,14 +715,15 @@ func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) error {
 		e.liveForwards[sp.ForwardID] = true
 		delete(e.retiredForwards, sp.ForwardID)
 	}
-	e.reconcileLocked(true, want)
-	return nil
+	removed := e.reconcileLocked(true, want)
+	return retired || removed, nil
 }
 
 // reconcileLocked 把一个域的 handles 收敛到 want：只触碰本域，另一域不受影响。
 // 缺失的撤销，规格没变的保持，同键变化时按 TCP/UDP 开关是否变化决定是否断掉已建立的
-// TCP 会话。
-func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relaySpec) {
+// TCP 会话。返回值表示是否有既有 handle 被撤销移除。
+func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relaySpec) bool {
+	removed := false
 	for key, h := range e.handles {
 		if h.isForward() != forwardDomain {
 			continue
@@ -720,6 +733,7 @@ func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relayS
 		}
 		e.closeHandleLocked(h, false)
 		delete(e.handles, key)
+		removed = true
 	}
 	for key, sp := range want {
 		h, ok := e.handles[key]
@@ -744,6 +758,7 @@ func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relayS
 		}
 		e.handles[key] = nh
 	}
+	return removed
 }
 
 // openLocked 打开一条转发的监听；失败只记录在该条目上，不影响其它条目。
@@ -897,7 +912,6 @@ func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
 	}
 	defer e.unregisterTCPSession(session)
 	defer session.closeConns()
-	defer relayWakeStats()
 	fwd := h.spec.ForwardID
 	if len(prefetched) > 0 {
 		if _, err := (relayCountingWriter{dst: up, upload: true, fwd: fwd}).Write(prefetched); err != nil {
@@ -1074,7 +1088,6 @@ func (t *relayUDP) evictOldestLocked() {
 	if s, ok := t.sessions[oldestKey]; ok {
 		delete(t.sessions, oldestKey)
 		s.closeConn()
-		relayWakeStats()
 	}
 }
 
@@ -1106,7 +1119,6 @@ func (t *relayUDP) drop(key string, s *relayUDPSession) {
 	}
 	t.mu.Unlock()
 	s.closeConn()
-	relayWakeStats()
 }
 
 // sweep 周期性拆除空闲会话；UDP 套接字关闭后 done 关闭，本 goroutine 随之退出。
@@ -1130,16 +1142,11 @@ func (t *relayUDP) prune(now int64) {
 	if t.closed {
 		return
 	}
-	removed := false
 	for key, s := range t.sessions {
 		if now-s.last.Load() >= int64(relayUDPIdle) {
 			delete(t.sessions, key)
 			s.closeConn()
-			removed = true
 		}
-	}
-	if removed {
-		relayWakeStats()
 	}
 }
 
@@ -1163,9 +1170,6 @@ func (t *relayUDP) close() {
 	_ = t.pc.Close()
 	for _, s := range sessions {
 		s.closeConn()
-	}
-	if len(sessions) > 0 {
-		relayWakeStats()
 	}
 }
 

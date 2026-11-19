@@ -308,7 +308,7 @@ func (s *session) closeConn() {
 }
 
 // serve 驱动整条会话：先上报用量再要 desired（失联期间的字节先入账），
-// 15s 心跳 + 保活 ping，60s stats，入口转发结束时刻立刻再报一次。
+// 15s 心跳 + 保活 ping，60s stats，转发条目撤销/退休时尽快补报尾量。
 // 收到 desired 即应用。返回即连接断开，由 Run 走退避重连。
 func (s *session) serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.closeConn)
@@ -352,13 +352,13 @@ func (s *session) serve(ctx context.Context) error {
 	if err := reportStats(ctx, s); err != nil {
 		logf(levelWarning, "%s", err.Error())
 	}
+	lastStats := time.Now()
 	if err := s.requestDesired(ctx); err != nil {
 		return err
 	}
 
 	heartbeat := time.NewTicker(heartbeatInterval)
 	defer heartbeat.Stop()
-	var lastStats time.Time
 	var gotDesired atomic.Bool
 	var retryDesired atomic.Bool
 

@@ -11,7 +11,8 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-const statsNudgeMin = 500 * time.Millisecond
+// statsNudgeMin 限制事件唤醒（转发撤销/退休冲刷尾量）的最小上报间隔，避免批量变更连环上报。
+const statsNudgeMin = 5 * time.Second
 
 // trafficMeter 在入站与 clash-meta-nw 隧道之间按块计原始字节。
 // 只计数，不截断；限额由面板在下一次 desired 收敛。
