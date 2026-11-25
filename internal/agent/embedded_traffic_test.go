@@ -21,8 +21,10 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/geodata"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener/inbound"
+	"github.com/metacubex/mihomo/tunnel"
 )
 
 const trafficTestPassword = "0123456789abcdef0123456789abcdef"
@@ -1012,5 +1014,106 @@ rules:
 	})
 	if probeRes.URLTest == nil || probeRes.URLTest.Status != "ok" || probeRes.URLTest.HTTPStatus != 204 {
 		t.Fatalf("expected nw3 cipher:aes probe ok 204, got %+v", probeRes.URLTest)
+	}
+}
+
+// 验证 embeddedRuntime.Stop() 会一并释放 mihomo 全局 proxies/rules 与 geodata singleflight 缓存，
+// 避免切到 xray/sing-box 或整机停服后常驻几十 MiB 旧索引与出站对象。
+func TestEmbeddedStopReleasesTunnelAndGeoCache(t *testing.T) {
+	dir := t.TempDir()
+	writeGeoSiteDat(t, dir, "geosite.dat", "alpha.example")
+	t.Cleanup(func() {
+		geodata.ClearGeoSiteCache()
+		geodata.ClearGeoIPCache()
+	})
+
+	cfg := `log-level: silent
+find-process-mode: "off"
+geodata-mode: true
+proxies:
+  - name: direct-out
+    type: direct
+    udp: true
+rules:
+  - GEOSITE,china-list,direct-out
+  - MATCH,DIRECT
+`
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Start embedded with geosite failed: %v", err)
+	}
+	if _, ok := tunnel.Proxies()["direct-out"]; !ok {
+		rt.Stop()
+		t.Fatalf("expected direct-out in tunnel.Proxies() before Stop")
+	}
+	if len(tunnel.Rules()) == 0 {
+		rt.Stop()
+		t.Fatal("expected non-empty tunnel.Rules() before Stop")
+	}
+	mBefore, err := geodata.LoadGeoSiteMatcher("china-list")
+	if err != nil || !mBefore.ApplyDomain("alpha.example") {
+		rt.Stop()
+		t.Fatalf("geosite matcher before Stop: err=%v", err)
+	}
+
+	rt.Stop()
+
+	if len(tunnel.Proxies()) != 0 {
+		t.Fatalf("expected tunnel.Proxies() empty after Stop, got %d", len(tunnel.Proxies()))
+	}
+	if len(tunnel.Rules()) != 0 {
+		t.Fatalf("expected tunnel.Rules() empty after Stop, got %d", len(tunnel.Rules()))
+	}
+	// 覆写 geosite.dat 后应直接读到新内容，证明 Stop() 已清掉核内 GeoSite 缓存。
+	writeGeoSiteDat(t, dir, "geosite.dat", "beta.example")
+	mAfter, err := geodata.LoadGeoSiteMatcher("china-list")
+	if err != nil {
+		t.Fatalf("LoadGeoSiteMatcher after Stop: %v", err)
+	}
+	if mAfter.ApplyDomain("alpha.example") || !mAfter.ApplyDomain("beta.example") {
+		t.Fatal("expected geosite cache cleared on Stop() so updated dat reloads")
+	}
+}
+
+// 验证 embeddedSSListener 连续新增用户时 keptGens 严格受 maxKeptSSGens 封顶，
+// 超出上限的最早代上下文被及时取消，避免高频增人叠加过多历史快照。
+func TestEmbeddedSSKeptGensCapped(t *testing.T) {
+	const serverPSK = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	lis, err := newEmbeddedSSListener(&inbound.ShadowSocksOption{
+		BaseOption: inbound.BaseOption{NameStr: "ss-cap", Listen: "127.0.0.1", Port: "0"},
+		Cipher:     "aes-256-gcm",
+		Password:   serverPSK,
+	}, []sharedUser{{Email: "u0", Secret: "secret-0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lis.Close() })
+
+	firstGen := lis.gen.Load()
+	users := []sharedUser{{Email: "u0", Secret: "secret-0"}}
+	for i := 1; i <= maxKeptSSGens+4; i++ {
+		users = append(users, sharedUser{
+			Email:  fmt.Sprintf("u%d", i),
+			Secret: fmt.Sprintf("secret-%d", i),
+		})
+		if _, err := lis.UpdateUsers(users); err != nil {
+			t.Fatalf("UpdateUsers #%d: %v", i, err)
+		}
+		lis.mu.Lock()
+		kept := len(lis.keptGens)
+		lis.mu.Unlock()
+		if kept > maxKeptSSGens {
+			t.Fatalf("keptGens=%d exceeded cap %d at iteration %d", kept, maxKeptSSGens, i)
+		}
+	}
+	select {
+	case <-firstGen.ctx.Done():
+	default:
+		t.Fatal("expected evicted oldest SS generation context to be cancelled")
 	}
 }

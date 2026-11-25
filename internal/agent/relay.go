@@ -50,6 +50,7 @@ const (
 	relayUDPSweep       = 10 * time.Second
 	relayUDPSessions    = 4096
 	relayUDPPendingMax  = 256
+	relayTCPBuffer      = 32 << 10
 	relayUDPBuffer      = 64 << 10
 	relayWantFile       = "relay-want.json"
 	// forwardCounterPrefix 是独立转发计数键的固定前缀：forward>>><id>>>traffic>>><方向>。
@@ -57,6 +58,23 @@ const (
 	forwardWantFile      = "forward-want.json"
 	relayMaxStates       = 512
 	relayMaxErrorLen     = 256
+)
+
+// relayTCPBufPool / relayUDPBufPool 复用转发热路径拷贝缓冲：
+// TCP 每连接减少 2×32KiB 分配抖动；UDP 配合 Unix RawConn.Read 按包借还，空闲会话不常驻 64KiB。
+var (
+	relayTCPBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, relayTCPBuffer)
+			return &b
+		},
+	}
+	relayUDPBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, relayUDPBuffer)
+			return &b
+		},
+	}
 )
 
 // relayHandle 是一条转发（legacy 入口端口或独立转发）的句柄。TCP 与 UDP 各自独立监听，
@@ -81,14 +99,15 @@ func relayPortKey(port int) string     { return "port:" + strconv.Itoa(port) }
 func relayForwardKey(id string) string { return "fwd:" + id }
 
 // relayUDP 持有入口端口的 UDP 套接字与客户端会话表；会话空闲 60 秒拆除，表有上限。
-// done 在 close 时关闭，sweep goroutine 据此退出。
+// ctx 在 close 时取消，sweep 与在途拨号据此退出。
 type relayUDP struct {
 	pc       net.PacketConn
 	mu       sync.Mutex
 	sessions map[string]*relayUDPSession
 	pending  map[string]struct{}
 	closed   bool
-	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 	fwd      string
 }
 
@@ -779,7 +798,8 @@ func (e *relayEngine) openLocked(sp relaySpec) *relayHandle {
 		if err != nil {
 			h.err = joinRelayErr(h.err, "udp: "+err.Error())
 		} else {
-			h.udp = &relayUDP{pc: pc, sessions: map[string]*relayUDPSession{}, done: make(chan struct{}), fwd: sp.ForwardID}
+			udpCtx, udpCancel := context.WithCancel(context.Background())
+			h.udp = &relayUDP{pc: pc, sessions: map[string]*relayUDPSession{}, ctx: udpCtx, cancel: udpCancel, fwd: sp.ForwardID}
 			go e.serveUDP(h.udp, sp)
 			go h.udp.sweep()
 		}
@@ -919,21 +939,29 @@ func (e *relayEngine) relayPipeTCP(client net.Conn, h *relayHandle) {
 		}
 	}
 	done := make(chan struct{}, 2)
+	copyHalf := func(dst io.Writer, src io.Reader, upload bool) {
+		bp := relayTCPBufPool.Get().(*[]byte)
+		defer relayTCPBufPool.Put(bp)
+		_, _ = io.CopyBuffer(relayCountingWriter{dst: dst, upload: upload, fwd: fwd}, src, *bp)
+	}
 	go func() {
-		_, _ = io.Copy(relayCountingWriter{dst: up, upload: true, fwd: fwd}, client)
+		copyHalf(up, client, true)
 		closeWrite(up)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(relayCountingWriter{dst: client, upload: false, fwd: fwd}, up)
+		copyHalf(client, up, false)
 		closeWrite(client)
 		done <- struct{}{}
 	}()
 	<-done
-	// 一侧结束后给反向流一个宽限窗口（半关闭场景），超时后两侧一起收。
+	// 一侧结束后给反向流一个宽限窗口（半关闭场景），超时后两侧一起收；
+	// 正常收尾立刻停表，避免每条 TCP 关闭都遗留 30s 定时器对象。
+	timer := time.NewTimer(relayHalfCloseGrace)
 	select {
 	case <-done:
-	case <-time.After(relayHalfCloseGrace):
+		timer.Stop()
+	case <-timer.C:
 	}
 }
 
@@ -1028,18 +1056,11 @@ func (t *relayUDP) finishDial(key string, up net.Conn) *relayUDPSession {
 }
 
 func (t *relayUDP) dialAndSend(sp relaySpec, target, key string, addr net.Addr, pkt []byte) {
-	ctx, cancel := context.WithCancel(context.Background())
-	if t.done != nil {
-		go func() {
-			select {
-			case <-t.done:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
+	dialCtx := t.ctx
+	if dialCtx == nil {
+		dialCtx = context.Background()
 	}
-	up, derr := sp.dialContext(ctx, "udp", target)
-	cancel()
+	up, derr := sp.dialContext(dialCtx, "udp", target)
 	if derr != nil {
 		t.clearPending(key)
 		return
@@ -1092,7 +1113,40 @@ func (t *relayUDP) evictOldestLocked() {
 }
 
 func (t *relayUDP) pumpBack(s *relayUDPSession, addr net.Addr) {
-	buf := make([]byte, relayUDPBuffer)
+	if relayUDPPooledSupported {
+		if sc, ok := s.up.(syscall.Conn); ok {
+			if rc, err := sc.SyscallConn(); err == nil {
+				for {
+					bp, n, err := readUpstreamUDPPooled(rc)
+					if bp != nil {
+						var werr error
+						if n > 0 {
+							var written int
+							written, werr = t.pc.WriteTo((*bp)[:n], addr)
+							if written > 0 {
+								relayNoteTo(t.fwd, int64(written), false)
+							}
+						}
+						relayUDPBufPool.Put(bp)
+						if werr != nil {
+							break
+						}
+						if n > 0 {
+							s.last.Store(time.Now().UnixNano())
+						}
+					}
+					if err != nil {
+						break
+					}
+				}
+				t.drop(addr.String(), s)
+				return
+			}
+		}
+	}
+	bp := relayUDPBufPool.Get().(*[]byte)
+	defer relayUDPBufPool.Put(bp)
+	buf := *bp
 	for {
 		n, err := s.up.Read(buf)
 		if n > 0 {
@@ -1121,13 +1175,17 @@ func (t *relayUDP) drop(key string, s *relayUDPSession) {
 	s.closeConn()
 }
 
-// sweep 周期性拆除空闲会话；UDP 套接字关闭后 done 关闭，本 goroutine 随之退出。
+// sweep 周期性拆除空闲会话；UDP 套接字关闭后 ctx 取消，本 goroutine 随之退出。
 func (t *relayUDP) sweep() {
+	var done <-chan struct{}
+	if t.ctx != nil {
+		done = t.ctx.Done()
+	}
 	ticker := time.NewTicker(relayUDPSweep)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-t.done:
+		case <-done:
 			return
 		case <-ticker.C:
 			t.prune(time.Now().UnixNano())
@@ -1157,9 +1215,7 @@ func (t *relayUDP) close() {
 		return
 	}
 	t.closed = true
-	if t.done != nil {
-		close(t.done)
-	}
+	cancel := t.cancel
 	clear(t.pending)
 	sessions := make([]*relayUDPSession, 0, len(t.sessions))
 	for key, s := range t.sessions {
@@ -1167,6 +1223,9 @@ func (t *relayUDP) close() {
 		delete(t.sessions, key)
 	}
 	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	_ = t.pc.Close()
 	for _, s := range sessions {
 		s.closeConn()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/hub/executor"
 	IN "github.com/metacubex/mihomo/listener/inbound"
 	mihomolog "github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
@@ -102,6 +104,7 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 	listeners := cfg.Listeners
 	cfg.Listeners = map[string]C.InboundListener{}
 	if err := applyMihomo(cfg); err != nil {
+		_ = cfg.Close()
 		return err
 	}
 	sharedSS := make(map[string]sharedDesired, len(shared))
@@ -182,6 +185,7 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 }
 
 func (e *embeddedRuntime) Stop() {
+	wasRunning := e.running.Swap(false)
 	if e.logSub != nil {
 		mihomolog.UnSubscribe(e.logSub)
 		e.logSub = nil
@@ -195,7 +199,17 @@ func (e *embeddedRuntime) Stop() {
 		_ = c.Close()
 		return true
 	})
-	e.running.Store(false)
+	// 释放全局 proxies/rules/sniffer 与 geo 匹配缓存，切到 xray/sing-box 或整机停服后
+	// 不把旧出站协议栈和几十 MiB GeoSite/GeoIP 索引留在进程堆里；不调 executor.Shutdown
+	// 以免触碰 iptables 或磁盘 cache.db。
+	tunnel.UpdateProxies(nil, nil)
+	tunnel.UpdateRules(nil, nil, nil)
+	tunnel.UpdateSniffer(nil)
+	geodata.ClearGeoSiteCache()
+	geodata.ClearGeoIPCache()
+	if wasRunning {
+		debug.FreeOSMemory()
+	}
 }
 
 func closeInboundListener(lis C.InboundListener) {

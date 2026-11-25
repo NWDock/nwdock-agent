@@ -504,14 +504,17 @@ func releaseIdleHeap(ctx context.Context) {
 	}
 }
 
-// shouldReleaseHeap 在可归还的空闲堆达到 128MiB 且多于在用堆时返回 true。
-// HeapReleased 已还给系统，不重复计算。
+// shouldReleaseHeap 在可归还的空闲堆达到 128MiB 且不少于在用堆一半时返回 true。
+// HeapReleased 已还给系统，不重复计算；用差值比较避免 uint64 乘法溢出。
 func shouldReleaseHeap(inuse, idle, released uint64) bool {
 	if idle < released {
 		return false
 	}
 	reclaimable := idle - released
-	return reclaimable >= heapReleaseMin && reclaimable > inuse
+	if reclaimable < heapReleaseMin {
+		return false
+	}
+	return reclaimable >= inuse-min(inuse, reclaimable)
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {

@@ -39,6 +39,10 @@ type ssServiceGen struct {
 	users   map[string]string
 }
 
+// maxKeptSSGens 限制仅新增用户时滞留排空旧 UDP NAT 的历史代上限，
+// 防止 5 分钟窗口内高频逐条加人叠加过多 MultiService 快照。
+const maxKeptSSGens = 4
+
 type keptSSGen struct {
 	cancel context.CancelFunc
 	timer  *time.Timer
@@ -229,11 +233,24 @@ func (l *embeddedSSListener) UpdateUsers(users []sharedUser) (map[string]bool, e
 }
 
 func (l *embeddedSSListener) keepGenUntilIdle(cancel context.CancelFunc) {
+	var evicted *keptSSGen
 	l.mu.Lock()
 	if l.closed.Load() {
 		l.mu.Unlock()
 		cancel()
 		return
+	}
+	if len(l.keptGens) >= maxKeptSSGens {
+		var oldestSeq uint64
+		for seq := range l.keptGens {
+			if oldestSeq == 0 || seq < oldestSeq {
+				oldestSeq = seq
+			}
+		}
+		if oldestSeq != 0 {
+			evicted = l.keptGens[oldestSeq]
+			delete(l.keptGens, oldestSeq)
+		}
 	}
 	l.keptSeq++
 	seq := l.keptSeq
@@ -251,6 +268,12 @@ func (l *embeddedSSListener) keepGenUntilIdle(cancel context.CancelFunc) {
 	})
 	l.keptGens[seq] = entry
 	l.mu.Unlock()
+	if evicted != nil {
+		if evicted.timer != nil {
+			evicted.timer.Stop()
+		}
+		evicted.cancel()
+	}
 }
 
 func (l *embeddedSSListener) drainKeptGens() {

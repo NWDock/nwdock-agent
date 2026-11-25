@@ -3,6 +3,7 @@ package agent
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,11 +137,14 @@ func TestShouldReleaseHeap(t *testing.T) {
 		want                  bool
 	}{
 		{600 * mib, 700 * mib, 0, true},
-		{600 * mib, 700 * mib, 600 * mib, false},
+		{350 * mib, 300 * mib, 0, true},
+		{600 * mib, 300 * mib, 0, true},
 		{600 * mib, 200 * mib, 0, false},
+		{600 * mib, 700 * mib, 600 * mib, false},
 		{100 * mib, 200 * mib, 80 * mib, false},
 		{0, 0, 0, false},
 		{100 * mib, 50 * mib, 80 * mib, false},
+		{math.MaxUint64, math.MaxUint64, 0, true},
 	} {
 		got := shouldReleaseHeap(tc.inuse, tc.idle, tc.released)
 		if got != tc.want {

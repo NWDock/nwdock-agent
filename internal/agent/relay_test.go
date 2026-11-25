@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -567,4 +569,72 @@ func TestRelayNonBlockingUDPDialAndPendingCap(t *testing.T) {
 	if _, start := tbl.lookupOrStartDial("overflow"); start {
 		t.Fatal("pending dial cap exceeded")
 	}
+}
+
+// 验证 UDP 转发在 Unix 上采用 RawConn 零空闲缓冲挂起 + 池化读包：
+// 256 条并发空闲真实 UDP 会话既能原样回传 4KiB 大包，又不再每会话常驻 64KiB（总计 16MiB）堆内存。
+func TestRelayUDPZeroIdleBufferAndLargeDatagram(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	t.Cleanup(relayStop)
+
+	sink := udpEchoSink(t)
+	entry := freeUDPPort(t)
+	relayEng.apply([]relaySpec{{Port: entry, TargetHost: "127.0.0.1", TargetPort: sink, UDP: true}})
+	waitRelayListening(t, entry)
+
+	const sessions = 256
+	payload := bytes.Repeat([]byte("U"), 4096)
+	rx := make([]byte, len(payload))
+	clients := make([]net.Conn, 0, sessions)
+	t.Cleanup(func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	})
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	baseG := runtime.NumGoroutine()
+
+	for i := range sessions {
+		c, err := net.Dial("udp", "127.0.0.1:"+strconv.Itoa(entry))
+		if err != nil {
+			t.Fatalf("dial udp %d: %v", i, err)
+		}
+		clients = append(clients, c)
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.Write(payload); err != nil {
+			t.Fatalf("write udp %d: %v", i, err)
+		}
+		n, err := c.Read(rx)
+		if err != nil || !bytes.Equal(rx[:n], payload) {
+			t.Fatalf("echo udp %d: n=%d err=%v", i, n, err)
+		}
+	}
+
+	// 清理 sync.Pool 并采样 256 条空闲会话仍在活跃挂起时的堆占用。
+	runtime.GC()
+	runtime.GC()
+	var during runtime.MemStats
+	runtime.ReadMemStats(&during)
+	var liveDelta int64
+	if during.HeapAlloc > before.HeapAlloc {
+		liveDelta = int64(during.HeapAlloc - before.HeapAlloc)
+	}
+	t.Logf("256 idle UDP sessions HeapAlloc delta=%d KiB (naive 64KiB/session=%d KiB)", liveDelta>>10, sessions*64)
+	if relayUDPPooledSupported && liveDelta > 8<<20 {
+		t.Fatalf("idle UDP sessions retained too much heap: %d bytes (want < 8MiB)", liveDelta)
+	}
+
+	relayStop()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseG+16 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("UDP relay goroutines did not exit after stop: before=%d after=%d", baseG, runtime.NumGoroutine())
 }

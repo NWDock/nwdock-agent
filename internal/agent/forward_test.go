@@ -684,7 +684,8 @@ func TestForwardUDPSweepExitsOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tbl := &relayUDP{pc: pc, sessions: map[string]*relayUDPSession{}, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	tbl := &relayUDP{pc: pc, sessions: map[string]*relayUDPSession{}, ctx: ctx, cancel: cancel}
 	exited := make(chan struct{})
 	go func() {
 		tbl.sweep()
@@ -697,9 +698,9 @@ func TestForwardUDPSweepExitsOnClose(t *testing.T) {
 		t.Fatal("sweep goroutine did not exit after close")
 	}
 	select {
-	case <-tbl.done:
+	case <-tbl.ctx.Done():
 	default:
-		t.Fatal("done channel not closed")
+		t.Fatal("udp context not canceled")
 	}
 }
 
