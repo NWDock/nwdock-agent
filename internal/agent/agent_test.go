@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	nwruntime "github.com/metacubex/mihomo/transport/nowhere/core/runtime"
 	"nowhere.local/agent/internal/keypin"
 )
 
@@ -145,6 +146,100 @@ func TestShouldReleaseHeap(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("inuse=%d idle=%d released=%d: got %v want %v", tc.inuse, tc.idle, tc.released, got, tc.want)
 		}
+	}
+}
+
+func TestDefaultNowhereMemoryProfile(t *testing.T) {
+	for _, tc := range []struct {
+		limit int64
+		want  string
+	}{
+		{0, "throughput"},
+		{2 << 30, "throughput"},
+		{1<<30 + 1, "throughput"},
+		{1 << 30, "balanced"},
+		{defaultMemoryLimit, "balanced"},
+		{512<<20 + 1, "balanced"},
+		{512 << 20, "memory"},
+		{minMemoryLimit, "memory"},
+	} {
+		if got := defaultNowhereMemoryProfile(tc.limit); got != tc.want {
+			t.Fatalf("limit=%d: got %q want %q", tc.limit, got, tc.want)
+		}
+	}
+}
+
+func TestLoadConfigNowhereEnvAndApply(t *testing.T) {
+	t.Setenv("AGENT_RUNTIME", "service")
+	t.Setenv("AGENT_DATA_DIR", "/tmp/agent-data")
+	t.Setenv("AGENT_PANEL_ENDPOINTS", "https://panel.example")
+	t.Setenv("AGENT_PANEL_KEYPIN", "abc")
+	t.Setenv("AGENT_MEMORY_LIMIT", "512MiB")
+	t.Setenv("NOW_TRANSPORT_MEMORY_PROFILE", "")
+	t.Setenv("NOW_QUIC_UDP_QUEUE_BYTES", "2097152")
+	t.Setenv("NOW_UDP_IDLE_TIMEOUT", "90s")
+	t.Setenv("NOW_MORPH_TCP_PRELUDE", "low7")
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NowhereMemoryProfile != "memory" {
+		t.Fatalf("auto profile=%q want memory", cfg.NowhereMemoryProfile)
+	}
+	if cfg.NowhereEnv["NOW_QUIC_UDP_QUEUE_BYTES"] != "2097152" || cfg.NowhereEnv["NOW_UDP_IDLE_TIMEOUT"] != "90s" {
+		t.Fatalf("unexpected NowhereEnv: %+v", cfg.NowhereEnv)
+	}
+	applyNowhereEnv(cfg)
+	settings, err := nwruntime.Load(trafficTestPassword, false)
+	if err != nil {
+		t.Fatalf("nwruntime.Load after applyNowhereEnv: %v", err)
+	}
+	if settings.Profile.Name != "memory" || settings.QUICUDPQueue != 2097152 || settings.UDPIdleTimeout.Seconds() != 90 {
+		t.Fatalf("unexpected nwruntime settings: %+v", settings)
+	}
+
+	// 显式档位优先于 AGENT_MEMORY_LIMIT 自动推导，且清掉旧的调优覆盖后应恢复默认。
+	t.Setenv("NOW_TRANSPORT_MEMORY_PROFILE", "throughput")
+	t.Setenv("NOW_QUIC_UDP_QUEUE_BYTES", "")
+	cfg, err = LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NowhereMemoryProfile != "throughput" {
+		t.Fatalf("explicit profile=%q want throughput", cfg.NowhereMemoryProfile)
+	}
+	applyNowhereEnv(cfg)
+	if _, exists := os.LookupEnv("NOW_QUIC_UDP_QUEUE_BYTES"); exists {
+		t.Fatalf("expected cleared NOW_QUIC_UDP_QUEUE_BYTES to be unset")
+	}
+	settings, err = nwruntime.Load(trafficTestPassword, false)
+	if err != nil {
+		t.Fatalf("nwruntime.Load after clearing override: %v", err)
+	}
+	if settings.Profile.Name != "throughput" || settings.QUICUDPQueue != nwruntime.DefaultQUICUDPQueue {
+		t.Fatalf("unexpected settings after clearing override: %+v", settings)
+	}
+
+	// 非法 NOW_* 值必须在加载阶段直接报错。
+	t.Setenv("NOW_TRANSPORT_MEMORY_PROFILE", "turbo")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "NOW_TRANSPORT_MEMORY_PROFILE") {
+		t.Fatalf("want NOW_TRANSPORT_MEMORY_PROFILE error, got %v", err)
+	}
+	t.Setenv("NOW_TRANSPORT_MEMORY_PROFILE", "balanced")
+	t.Setenv("NOW_UDP_IDLE_TIMEOUT", "-5s")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "NOW_UDP_IDLE_TIMEOUT") {
+		t.Fatalf("want NOW_UDP_IDLE_TIMEOUT error, got %v", err)
+	}
+	t.Setenv("NOW_UDP_IDLE_TIMEOUT", "90s")
+	t.Setenv("NOW_PORTAL_TLS_IDLE_MAX", "2000")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "NOW_PORTAL_TLS_IDLE_MAX") {
+		t.Fatalf("want NOW_PORTAL_TLS_IDLE_MAX error, got %v", err)
+	}
+	t.Setenv("NOW_PORTAL_TLS_IDLE_MAX", "")
+	t.Setenv("NOW_TRANSPORT_MEM_PROFILE", "memory")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "NOW_TRANSPORT_MEM_PROFILE") {
+		t.Fatalf("want unknown NOW_* fail-closed error, got %v", err)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,10 @@ type Config struct {
 	XrayAPI    string
 	// MemoryLimit 是进程软内存上限，单位字节。0 表示不设，只在显式 off 时出现。
 	MemoryLimit int64
+	// NowhereEnv 是校验通过的 Nowhere 3.4 运行时调优变量（来自 agent.conf 或进程环境）。
+	NowhereEnv map[string]string
+	// NowhereMemoryProfile 是生效的 Nowhere 3.4 QUIC 内存档位（显式优先，否则按 MemoryLimit 推导）。
+	NowhereMemoryProfile string
 
 	fromFile   bool
 	noteMihomo bool
@@ -41,13 +46,19 @@ type Config struct {
 // LoadConfig reads the process environment. Existing variables win over files
 // already loaded into the environment.
 func LoadConfig(envDir string) (Config, error) {
+	var envKeys []string
+	for _, entry := range os.Environ() {
+		if key, _, ok := strings.Cut(entry, "="); ok {
+			envKeys = append(envKeys, key)
+		}
+	}
 	return buildConfig(envDir, func(primary string, aliases ...string) string {
 		value, _ := envfile.First(primary, aliases...)
 		return value
 	}, func(key string) bool {
 		value, ok := os.LookupEnv(key)
 		return ok && value != ""
-	})
+	}, envKeys)
 }
 
 // LoadConfigFile reads path as the only source of agent settings. The process
@@ -73,13 +84,17 @@ func LoadConfigFile(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	fileKeys := make([]string, 0, len(values))
+	for key := range values {
+		fileKeys = append(fileKeys, key)
+	}
 	cfg, err := buildConfig(filepath.Dir(abs), func(primary string, aliases ...string) string {
 		value, _ := envfile.Lookup(values, primary, aliases...)
 		return value
 	}, func(key string) bool {
 		value, ok := values[key]
 		return ok && value != ""
-	})
+	}, fileKeys)
 	if err != nil {
 		return Config{}, err
 	}
@@ -89,7 +104,7 @@ func LoadConfigFile(path string) (Config, error) {
 	return cfg, nil
 }
 
-func buildConfig(base string, pick func(primary string, aliases ...string) string, set func(string) bool) (Config, error) {
+func buildConfig(base string, pick func(primary string, aliases ...string) string, set func(string) bool, sourceKeys []string) (Config, error) {
 	dataDir := pick("AGENT_DATA_DIR", "DATA_DIR")
 	keyPin := pick("AGENT_PANEL_KEYPIN")
 	token := pick("AGENT_ENROLL_TOKEN", "NOWHERE_ENROLL_TOKEN")
@@ -118,6 +133,16 @@ func buildConfig(base string, pick func(primary string, aliases ...string) strin
 		return Config{}, err
 	}
 	cfg.MemoryLimit = limit
+	nowhereEnv, err := parseNowhereEnv(pick, sourceKeys)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.NowhereEnv = nowhereEnv
+	if prof := nowhereEnv[nowhereEnvMemoryProfile]; prof != "" {
+		cfg.NowhereMemoryProfile = prof
+	} else {
+		cfg.NowhereMemoryProfile = defaultNowhereMemoryProfile(limit)
+	}
 	if cfg.Runtime != "service" && cfg.Runtime != "docker" {
 		return Config{}, errors.New("AGENT_RUNTIME must be service or docker")
 	}
@@ -226,12 +251,150 @@ func parseByteCount(s string) (int64, bool) {
 	return int64(un), true
 }
 
-// scrubAgentEnv drops agent settings from the process environment so a core
-// subprocess started with os.Environ cannot see them.
+// Nowhere 3.4 运行时调优变量白名单，口径与 third_party/clash-meta-nw/transport/nowhere/core/runtime 对齐。
+const (
+	nowhereEnvMemoryProfile = "NOW_TRANSPORT_MEMORY_PROFILE"
+	nowhereEnvMaxPortalIdle = 1023
+	nowhereEnvMaxQUICQueue  = int64(^uint32(0))
+	nowhereEnvMaxInt        = int64(^uint(0) >> 1)
+)
+
+var nowhereEnvKeys = []string{
+	nowhereEnvMemoryProfile,
+	"NOW_TCP_DATA_BUF_SIZE",
+	"NOW_TCP_DIAL_TIMEOUT",
+	"NOW_UDP_DIAL_TIMEOUT",
+	"NOW_HANDSHAKE_TIMEOUT",
+	"NOW_FLOW_SETUP_TIMEOUT",
+	"NOW_TCP_READ_TIMEOUT",
+	"NOW_UDP_IDLE_TIMEOUT",
+	"NOW_QUIC_UDP_QUEUE_BYTES",
+	"NOW_SHUTDOWN_TIMEOUT",
+	"NOW_SERVICE_COOLDOWN",
+	"NOW_EGRESS_TLS_POOL_MAX",
+	"NOW_PORTAL_TLS_IDLE_MAX",
+	"NOW_MORPH_TCP_PRELUDE",
+	"NOW_MORPH_UDP_PRELUDE",
+}
+
+// defaultNowhereMemoryProfile 在未显式指定 NOW_TRANSPORT_MEMORY_PROFILE 时，
+// 按 AGENT_MEMORY_LIMIT 推导匹配的 Nowhere 3.4 QUIC 窗口档位，避免 32MiB 默认窗口顶穿软上限。
+func defaultNowhereMemoryProfile(limit int64) string {
+	if limit <= 0 || limit > (1<<30) {
+		return "throughput"
+	}
+	if limit <= (512 << 20) {
+		return "memory"
+	}
+	return "balanced"
+}
+
+func parseNowhereEnv(pick func(primary string, aliases ...string) string, sourceKeys []string) (map[string]string, error) {
+	var unknown []string
+	for _, key := range sourceKeys {
+		if strings.HasPrefix(key, "NOW_") && !slices.Contains(nowhereEnvKeys, key) {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		unknown = slices.Compact(unknown)
+		return nil, fmt.Errorf("unknown NOW_* setting: %s", strings.Join(unknown, ", "))
+	}
+	out := map[string]string{}
+	for _, key := range nowhereEnvKeys {
+		raw := strings.TrimSpace(pick(key))
+		if raw == "" {
+			continue
+		}
+		if err := validateNowhereEnvValue(key, raw); err != nil {
+			return nil, err
+		}
+		out[key] = raw
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func validateNowhereEnvValue(key, value string) error {
+	switch key {
+	case nowhereEnvMemoryProfile:
+		switch value {
+		case "memory", "balanced", "throughput":
+			return nil
+		default:
+			return fmt.Errorf("%s must be memory, balanced or throughput", key)
+		}
+	case "NOW_MORPH_TCP_PRELUDE", "NOW_MORPH_UDP_PRELUDE":
+		// 注意：NOW_MORPH_TCP_PRELUDE=fade 仅适用于 nw3；存量 nw2 载体只接受 low7 / full8
+		// （留空时各自走默认：nw3=fade、nw2=full8）。
+		switch value {
+		case "fade", "full8", "low7":
+			return nil
+		default:
+			return fmt.Errorf("%s must be fade, full8 or low7", key)
+		}
+	case "NOW_TCP_DATA_BUF_SIZE", "NOW_EGRESS_TLS_POOL_MAX":
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 1 || n > nowhereEnvMaxInt {
+			return fmt.Errorf("%s: invalid integer", key)
+		}
+		return nil
+	case "NOW_QUIC_UDP_QUEUE_BYTES":
+		queueMax := nowhereEnvMaxQUICQueue
+		if nowhereEnvMaxInt < queueMax {
+			queueMax = nowhereEnvMaxInt
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 1 || n > queueMax {
+			return fmt.Errorf("%s: invalid integer", key)
+		}
+		return nil
+	case "NOW_PORTAL_TLS_IDLE_MAX":
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 1 || n > nowhereEnvMaxPortalIdle {
+			return fmt.Errorf("%s: invalid integer", key)
+		}
+		return nil
+	default:
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("%s: invalid duration", key)
+		}
+		return nil
+	}
+}
+
+func applyNowhereEnv(cfg Config) {
+	for _, key := range nowhereEnvKeys {
+		if value, ok := cfg.NowhereEnv[key]; ok && value != "" {
+			_ = os.Setenv(key, value)
+		} else {
+			// 未在生效配置中指定的白名单变量统一清掉（含空字符串占位与旧值残留），
+			// 防止 Nowhere 3.4 runtime.Load 拒收空值并保证多次应用幂等。
+			_ = os.Unsetenv(key)
+		}
+	}
+	profile := cfg.NowhereMemoryProfile
+	if profile == "" {
+		profile = defaultNowhereMemoryProfile(cfg.MemoryLimit)
+	}
+	_ = os.Setenv(nowhereEnvMemoryProfile, profile)
+	source := "auto"
+	if cfg.NowhereEnv[nowhereEnvMemoryProfile] != "" {
+		source = "config"
+	}
+	logf(levelInfo, "nowhere memory profile %s (%s)", profile, source)
+}
+
+// scrubAgentEnv drops agent and NOW_* settings from the process environment so
+// -config mode stays strictly file-driven and core subprocesses cannot see them.
 func scrubAgentEnv() {
 	for _, entry := range os.Environ() {
 		key, _, ok := strings.Cut(entry, "=")
-		if ok && strings.HasPrefix(key, "AGENT_") {
+		if ok && (strings.HasPrefix(key, "AGENT_") || strings.HasPrefix(key, "NOW_")) {
 			os.Unsetenv(key)
 		}
 	}
@@ -254,6 +417,7 @@ func scrubAgentEnv() {
 // 15s 心跳、60s stats；断开走退避 + jitter + endpoint 轮转重连。
 func Run(ctx context.Context, cfg Config) error {
 	applyMemoryLimit(ctx, cfg.MemoryLimit)
+	applyNowhereEnv(cfg)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}

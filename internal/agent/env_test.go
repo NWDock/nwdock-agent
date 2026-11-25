@@ -199,3 +199,76 @@ func TestLoadConfigLegacyDataDir(t *testing.T) {
 		t.Fatal(cfg.DataDir, cfg.Token, cfg.KeyPin)
 	}
 }
+
+func TestLoadConfigFileNowhereEnvPassthroughAndScrub(t *testing.T) {
+	t.Cleanup(ClearFileRuntime)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.conf")
+	body := strings.Join([]string{
+		"AGENT_RUNTIME=service",
+		"AGENT_PANEL_ENDPOINTS=https://panel.example",
+		"AGENT_PANEL_KEYPIN=from-file",
+		"AGENT_MEMORY_LIMIT=512MiB",
+		"NOW_TRANSPORT_MEMORY_PROFILE=memory",
+		"NOW_QUIC_UDP_QUEUE_BYTES=1048576",
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NOW_TRANSPORT_MEMORY_PROFILE", "throughput")
+	t.Setenv("NOW_UDP_IDLE_TIMEOUT", "30s")
+	t.Setenv("NOW_UNKNOWN_INHERITED", "1")
+
+	cfg, err := LoadConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NowhereMemoryProfile != "memory" || cfg.NowhereEnv["NOW_QUIC_UDP_QUEUE_BYTES"] != "1048576" {
+		t.Fatalf("unexpected NowhereEnv: profile=%q env=%+v", cfg.NowhereMemoryProfile, cfg.NowhereEnv)
+	}
+	if _, inherited := cfg.NowhereEnv["NOW_UDP_IDLE_TIMEOUT"]; inherited {
+		t.Fatalf("inherited NOW_UDP_IDLE_TIMEOUT leaked into file config: %+v", cfg.NowhereEnv)
+	}
+	if os.Getenv("NOW_UDP_IDLE_TIMEOUT") != "" || os.Getenv("NOW_TRANSPORT_MEMORY_PROFILE") != "" || os.Getenv("NOW_UNKNOWN_INHERITED") != "" {
+		t.Fatalf("LoadConfigFile did not scrub inherited NOW_* env")
+	}
+
+	// agent.conf 含非法或未知 NOW_* 键时必须 fail-closed 拒收，且不得污染原进程环境。
+	badPath := filepath.Join(dir, "bad.conf")
+	badBody := strings.Join([]string{
+		"AGENT_RUNTIME=service",
+		"AGENT_PANEL_ENDPOINTS=https://panel.example",
+		"AGENT_PANEL_KEYPIN=from-file",
+		"NOW_TRANSPORT_MEMORY_PROFILE=invalid",
+		"",
+	}, "\n")
+	if err := os.WriteFile(badPath, []byte(badBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NOW_UDP_IDLE_TIMEOUT", "45s")
+	if _, err := LoadConfigFile(badPath); err == nil || !strings.Contains(err.Error(), "NOW_TRANSPORT_MEMORY_PROFILE") {
+		t.Fatalf("expected invalid NOW_TRANSPORT_MEMORY_PROFILE error, got %v", err)
+	}
+	if os.Getenv("NOW_UDP_IDLE_TIMEOUT") != "45s" {
+		t.Fatalf("rejected config file mutated env: %q", os.Getenv("NOW_UDP_IDLE_TIMEOUT"))
+	}
+
+	unknownPath := filepath.Join(dir, "unknown.conf")
+	unknownBody := strings.Join([]string{
+		"AGENT_RUNTIME=service",
+		"AGENT_PANEL_ENDPOINTS=https://panel.example",
+		"AGENT_PANEL_KEYPIN=from-file",
+		"NOW_TRANSPORT_MEM_PROFILE=memory",
+		"",
+	}, "\n")
+	if err := os.WriteFile(unknownPath, []byte(unknownBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfigFile(unknownPath); err == nil || !strings.Contains(err.Error(), "NOW_TRANSPORT_MEM_PROFILE") {
+		t.Fatalf("expected unknown NOW_* error, got %v", err)
+	}
+	if os.Getenv("NOW_UDP_IDLE_TIMEOUT") != "45s" {
+		t.Fatalf("rejected unknown NOW_* mutated env: %q", os.Getenv("NOW_UDP_IDLE_TIMEOUT"))
+	}
+}

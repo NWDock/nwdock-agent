@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,6 +95,7 @@ func newEmbeddedSSListener(opt *IN.ShadowSocksOption, users []sharedUser) (*embe
 		return nil, errors.New("nil shadowsocks option")
 	}
 	cp := *opt
+	cp.Users = maps.Clone(opt.Users)
 	base, err := IN.NewBase(&cp.BaseOption)
 	if err != nil {
 		return nil, err
@@ -153,6 +156,9 @@ func (l *embeddedSSListener) buildGen(users []sharedUser) (*ssServiceGen, error)
 	case common.Contains(shadowaead_2022.List, cipher):
 		ms, err := shadowaead_2022.NewMultiServiceWithPassword[string](cipher, l.config.Password, udpTimeout, l.handler, ntp.Now)
 		if err != nil {
+			if errors.Is(err, os.ErrInvalid) {
+				return nil, fmt.Errorf("shadowsocks: unsupported multi-user cipher %q", cipher)
+			}
 			return nil, err
 		}
 		if err := ms.UpdateUsersWithPasswords(userList, passList); err != nil {

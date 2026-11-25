@@ -28,6 +28,7 @@ cp .env.agent.example .env.agent
 - `AGENT_PANEL_KEYPIN`：面板 stdout 里 `panel identity` 的指纹。
 - `AGENT_ENROLL_TOKEN`：只在身份还没绑定的时候需要。登记完成后从环境文件删掉。
 - `AGENT_MEMORY_LIMIT`：本进程软内存上限，缺省 `768MiB`。`off` 关闭。xray 与 sing-box 是外部进程，不受这项管。
+- `NOW_TRANSPORT_MEMORY_PROFILE`：Nowhere 3.4 QUIC 窗口档位（`memory` / `balanced` / `throughput`）。留空时按 `AGENT_MEMORY_LIMIT` 自动选择：`≤512MiB` 选 `memory`（Conn 16 MiB / Send 8 MiB），`≤1GiB`（含默认 `768MiB`）选 `balanced`（Conn/Send 16 MiB，上游默认是 `throughput` 32 MiB），`>1GiB` 或 `off` 选 `throughput`。高带宽高延迟（大 BDP）节点如需 32 MiB 窗口可显式设为 `throughput` 或调高/关闭 `AGENT_MEMORY_LIMIT`。其余 Nowhere 3.4 官方 `NOW_*` 调优项同样支持经 `agent.conf` / 环境变量透传并在启动期校验；未知 `NOW_*` 键直接拒启（fail-closed）；`NOW_MORPH_TCP_PRELUDE=fade` 仅适用于 nw3，存量 nw2 节点仅接受 `low7`/`full8` 或留空走各栈默认。
 
 身份私钥在数据目录的 `agent-identity.key`（`0600`）。删掉它等于取消登记，下次要新的安装令牌。
 
