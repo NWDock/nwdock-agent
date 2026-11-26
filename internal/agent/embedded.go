@@ -63,6 +63,10 @@ func (e *embeddedRuntime) Start(ctx context.Context, configPath, dir string) err
 
 func (e *embeddedRuntime) StartShared(ctx context.Context, configPath, dir string, shared []sharedDesired) error {
 	// mihomo 自身仍打印到 stdout；这里订阅 observable 只是把事件收入日志环供面板查看。
+	if e.logSub != nil {
+		mihomolog.UnSubscribe(e.logSub)
+		e.logSub = nil
+	}
 	e.logSub = mihomolog.Subscribe()
 	go e.captureLogs(e.logSub)
 	if err := e.Apply(ctx, configPath, dir, nil, "", shared, true, false); err != nil {
@@ -89,7 +93,46 @@ func mihomologLevel(level mihomolog.LogLevel) string {
 	}
 }
 
-func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, shared []sharedDesired, geoChanged, _ bool) error {
+// ApplySharedOnly 在核心配置、证书与 geo 均未变化时，尝试仅原地热更已运行的
+// 共享 Shadowsocks 多用户监听器；不触碰 config.Parse / executor.ApplyConfig，
+// 避免仅转发/入口变更或 SS 用户增删时引发整核堆峰与既有出站断连。
+func (e *embeddedRuntime) ApplySharedOnly(shared []sharedDesired) bool {
+	if !e.running.Load() {
+		return false
+	}
+	sharedSS := make(map[string]sharedDesired, len(shared))
+	for _, item := range shared {
+		if item.Protocol == "shadowsocks" && item.Tag != "" {
+			sharedSS[item.Tag] = item
+		}
+	}
+	activeSSCount := 0
+	for name, lis := range e.listeners {
+		if _, isSS := lis.(*embeddedSSListener); isSS {
+			if _, ok := sharedSS[name]; !ok {
+				return false
+			}
+			activeSSCount++
+		}
+	}
+	if activeSSCount != len(sharedSS) {
+		return false
+	}
+	for name, spec := range sharedSS {
+		oldSS, ok := e.listeners[name].(*embeddedSSListener)
+		if !ok {
+			return false
+		}
+		dropped, err := oldSS.UpdateUsers(spec.Users)
+		if err != nil {
+			return false
+		}
+		traffic.closeInboundUsers(name, dropped)
+	}
+	return true
+}
+
+func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map[string][]byte, _ string, shared []sharedDesired, geoChanged, filesChanged bool) error {
 	C.SetHomeDir(dir)
 	if geoChanged {
 		// geo 资产有变（内容更新或大小写孪生清理）时清掉核内匹配缓存：
@@ -155,7 +198,7 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 			}
 		}
 		_, oldWasSharedSS := old.(*embeddedSSListener)
-		if old != nil && !oldWasSharedSS && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
+		if old != nil && !oldWasSharedSS && !filesChanged && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
 			next[name] = old
 			continue
 		}

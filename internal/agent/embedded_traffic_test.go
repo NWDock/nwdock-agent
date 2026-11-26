@@ -1387,3 +1387,177 @@ func TestEmbeddedSSKeptGensCapped(t *testing.T) {
 		t.Fatal("expected evicted oldest SS generation context to be cancelled")
 	}
 }
+
+// 验证核心配置与文件均未变化时，ApplySharedOnly 仅原地热更共享 SS 用户，
+// 不重新解析配置也不调 executor.ApplyConfig，保留既有出站代理与 Nowhere 监听实例。
+func TestEmbeddedApplySharedOnlySkipsReload(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	dir := t.TempDir()
+	nwPort := freePort(t)
+	ssPort := freePort(t)
+	const serverPSK = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-keep
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: tcp
+    morph: true
+    grade: core
+  - name: sh-ss-only
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %d
+    cipher: aes-256-gcm
+    password: %s
+    udp: true
+proxies:
+  - name: direct-out
+    type: direct
+    udp: true
+rules:
+  - MATCH,direct-out
+`, nwPort, trafficTestPassword, ssPort, serverPSK)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newEmbeddedRuntime()
+	initialShared := []sharedDesired{{
+		Tag:      "sh-ss-only",
+		Protocol: "shadowsocks",
+		Users:    []sharedUser{{Email: "u1", Secret: "secret-1"}},
+	}}
+	if err := rt.StartShared(context.Background(), cfgPath, dir, initialShared); err != nil {
+		t.Fatalf("StartShared failed: %v", err)
+	}
+	t.Cleanup(rt.Stop)
+
+	proxyBefore := tunnel.Proxies()["direct-out"]
+	nwBefore := rt.listeners["nw-keep"]
+	ssBefore, ok := rt.listeners["sh-ss-only"].(*embeddedSSListener)
+	if proxyBefore == nil || nwBefore == nil || !ok {
+		t.Fatalf("unexpected initial state: proxy=%v nw=%v ss=%T", proxyBefore, nwBefore, rt.listeners["sh-ss-only"])
+	}
+
+	// 1) 原地新增 u2 并踢除 u1：ApplySharedOnly 必须命中且不重建出站与 Nowhere 监听。
+	updatedShared := []sharedDesired{{
+		Tag:      "sh-ss-only",
+		Protocol: "shadowsocks",
+		Users:    []sharedUser{{Email: "u2", Secret: "secret-2"}},
+	}}
+	if !rt.ApplySharedOnly(updatedShared) {
+		t.Fatal("expected ApplySharedOnly to succeed when shared SS tags are unchanged")
+	}
+	if tunnel.Proxies()["direct-out"] != proxyBefore {
+		t.Fatal("ApplySharedOnly must not rebuild tunnel proxies")
+	}
+	if rt.listeners["nw-keep"] != nwBefore {
+		t.Fatal("ApplySharedOnly must not recreate nowhere listener")
+	}
+	if rt.listeners["sh-ss-only"] != ssBefore {
+		t.Fatal("ApplySharedOnly must update embeddedSSListener in-place")
+	}
+	gen := ssBefore.gen.Load()
+	if gen == nil || len(gen.users) != 1 || gen.users["u2"] != "secret-2" {
+		t.Fatalf("unexpected updated SS users: %+v", gen)
+	}
+
+	// 2) 共享 SS 标签集合发生变化时，必须返回 false 回退全量 Apply。
+	if rt.ApplySharedOnly(nil) {
+		t.Fatal("expected ApplySharedOnly to return false when an active shared SS tag is removed")
+	}
+	if rt.ApplySharedOnly([]sharedDesired{
+		updatedShared[0],
+		{Tag: "sh-ss-new", Protocol: "shadowsocks", Users: []sharedUser{{Email: "u3", Secret: "secret-3"}}},
+	}) {
+		t.Fatal("expected ApplySharedOnly to return false when a new shared SS tag is added")
+	}
+}
+
+// 验证 embeddedRuntime.Apply 在 filesChanged=false 时复用未变监听，
+// 在 filesChanged=true（证书内容同路径续期）时重建监听以立即加载新证书。
+func TestEmbeddedApplyFilesChangedRecreatesListener(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	certA, keyA, _, err := ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, []byte(certA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyA), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	port := freePort(t)
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-cert
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    certificate: %q
+    private-key: %q
+    alpn: [nw3]
+    net: tcp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, port, trafficTestPassword, certPath, keyPath)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(rt.Stop)
+
+	first := rt.listeners["nw-cert"]
+	if first == nil {
+		t.Fatal("expected nw-cert listener")
+	}
+
+	// filesChanged=false：配置未变应复用原监听实例。
+	if err := rt.Apply(context.Background(), cfgPath, dir, nil, "", nil, false, false); err != nil {
+		t.Fatalf("Apply filesChanged=false failed: %v", err)
+	}
+	if rt.listeners["nw-cert"] != first {
+		t.Fatal("expected unchanged listener to be reused when filesChanged=false")
+	}
+
+	// 覆写同路径证书并传 filesChanged=true：必须重建监听而非继续复用。
+	certB, keyB, _, err := ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, []byte(certB), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyB), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Apply(context.Background(), cfgPath, dir, nil, "", nil, false, true); err != nil {
+		t.Fatalf("Apply filesChanged=true failed: %v", err)
+	}
+	if rt.listeners["nw-cert"] == first {
+		t.Fatal("expected listener to be recreated when filesChanged=true")
+	}
+}

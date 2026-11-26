@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -158,5 +160,63 @@ func TestCoreStartedAtLifecycle(t *testing.T) {
 	resetProc(&fakeCoreRuntime{running: false}, booted)
 	if got := runningCoreStartedAt(); !got.IsZero() {
 		t.Fatalf("crashed core must be zero, got %v", got)
+	}
+}
+
+func TestWriteFilesSkipsUnchangedWrite(t *testing.T) {
+	dir := t.TempDir()
+	files := []desiredFile{{Path: "certs/a.pem", Mode: "0644", PEM: "cert-v1"}}
+	changed, _, err := writeFiles(dir, files)
+	if err != nil || !changed {
+		t.Fatalf("first writeFiles: changed=%v err=%v", changed, err)
+	}
+	target := filepath.Join(dir, "certs/a.pem")
+	past := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(target, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	// 内容与权限均未变时，不得触发写盘，避免惊动证书文件监听。
+	changed, _, err = writeFiles(dir, files)
+	if err != nil || changed {
+		t.Fatalf("unchanged writeFiles: changed=%v err=%v", changed, err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Fatalf("unchanged file must not be rewritten: mtime=%v want=%v", info.ModTime(), past)
+	}
+
+	// 内容变化时正常写盘并返回 changed=true。
+	changed, _, err = writeFiles(dir, []desiredFile{{Path: "certs/a.pem", Mode: "0644", PEM: "cert-v2"}})
+	if err != nil || !changed {
+		t.Fatalf("updated writeFiles: changed=%v err=%v", changed, err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "cert-v2" {
+		t.Fatalf("updated content=%q err=%v", data, err)
+	}
+}
+
+func TestStageConfigSkipsUnchangedTest(t *testing.T) {
+	dir := t.TempDir()
+	raw := json.RawMessage(`{"log-level":"silent","rules":["MATCH,DIRECT"]}`)
+	rendered, err := absolutizeMihomo(raw, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 当 prevBytes 与渲染后字节完全一致且文件未变时，skipUnchangedTest=true 必须直接短路，
+	// 不写 staging 文件也不触发核心 test。
+	got, changed, err := stageConfig(context.Background(), dir, coreMihomo, "", raw, nil, rendered, true, true)
+	if err != nil || changed {
+		t.Fatalf("stageConfig unchanged: changed=%v err=%v", changed, err)
+	}
+	if string(got) != string(rendered) {
+		t.Fatalf("rendered mismatch: got %s want %s", got, rendered)
+	}
+	if _, err := os.Stat(filepath.Join(dir, coreStagingName(coreMihomo))); !os.IsNotExist(err) {
+		t.Fatalf("expected staging file not written on unchanged short-circuit, stat err=%v", err)
 	}
 }

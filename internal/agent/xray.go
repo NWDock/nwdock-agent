@@ -371,7 +371,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	}
 	current := filepath.Join(s.cfg.DataDir, coreConfigName(want))
 	prevBytes, prevErr := os.ReadFile(current)
-	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, filled, body.Files)
+	skipUnchangedTest := runningLocked() && proc.core == want && !geoChanged
+	rendered, changed, err := stageConfig(ctx, s.cfg.DataDir, want, bin, filled, body.Files, prevBytes, prevErr == nil, skipUnchangedTest)
 	if err != nil {
 		if switching {
 			logf(levelError, "degraded: keeping %s: %s", proc.core, err.Error())
@@ -404,6 +405,21 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		}
 	case want == coreSingbox && !geoChanged && !changed && configUnchanged:
 		// 仅转发端口（relays/forwards）变更而 sing-box 核心配置、证书、geo 分毫无变时跳过重启，不断既有代理连接。
+	case want == coreMihomo && !geoChanged && !changed && configUnchanged:
+		if emb, ok := proc.rt.(*embeddedRuntime); ok && emb.ApplySharedOnly(body.Shared) {
+			// 仅转发/入口变更或共享 SS 用户热更：跳过 config.Parse 与 executor.ApplyConfig，
+			// 避免重建全部出站代理与 geo 规则带来的断连和堆内存峰值。
+		} else {
+			if proc.rt == nil {
+				return errors.New("core is not running")
+			}
+			if err := proc.rt.Apply(ctx, current, s.cfg.DataDir, raws, skel, body.Shared, geoChanged, changed); err != nil {
+				logf(levelWarning, "%s", err.Error())
+				if err := restartLocked(ctx, s, s.cfg, api, bin, want, current, raws, skel, body.Shared); err != nil {
+					return err
+				}
+			}
+		}
 	default:
 		plan := sameCorePlan(want, proc.skeleton != skel)
 		if geoChanged && want != coreMihomo {
@@ -436,7 +452,7 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 	return writeGeneration(s.cfg.DataDir, body.Generation)
 }
 
-func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw json.RawMessage, files []desiredFile) ([]byte, bool, error) {
+func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw json.RawMessage, files []desiredFile, prevBytes []byte, hasPrev, skipUnchangedTest bool) ([]byte, bool, error) {
 	changed, restore, err := writeFiles(dir, files)
 	if err != nil {
 		return nil, false, err
@@ -453,6 +469,9 @@ func stageConfig(ctx context.Context, dir string, kind coreKind, bin string, raw
 			return nil, false, err
 		}
 		rendered = abs
+	}
+	if skipUnchangedTest && !changed && hasPrev && bytes.Equal(prevBytes, rendered) {
+		return rendered, false, nil
 	}
 	next := filepath.Join(dir, coreStagingName(kind))
 	if err := os.WriteFile(next, rendered, 0o600); err != nil {
@@ -873,6 +892,7 @@ func writeFiles(dir string, files []desiredFile) (bool, func(), error) {
 		}
 		item := snap{path: path, mode: mode}
 		prev, err := os.ReadFile(path)
+		fileChanged := false
 		if err == nil {
 			info, statErr := os.Stat(path)
 			item.existed = true
@@ -882,12 +902,19 @@ func writeFiles(dir string, files []desiredFile) (bool, func(), error) {
 			}
 			if !bytes.Equal(prev, []byte(file.PEM)) {
 				changed = true
+				fileChanged = true
+			} else if item.mode != mode {
+				fileChanged = true
 			}
 		} else if os.IsNotExist(err) {
 			changed = true
+			fileChanged = true
 		} else {
 			restore()
 			return false, nil, err
+		}
+		if !fileChanged {
+			continue
 		}
 		snaps = append(snaps, item)
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
