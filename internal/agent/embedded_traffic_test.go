@@ -1017,6 +1017,276 @@ rules:
 	}
 }
 
+// Nowhere 3.5.0（clash-meta-nw v3.5.0）：验证 Morph Grade（grade: core）在 TCP 与 QUIC/UDP 载体、
+// ChaCha20 与 AES-128-CTR 算法组合下的转发与计费、配置校验（含 morph=false 与 nw2 拒收）、
+// grade 不匹配拒连与 probe 端到端探测。
+func TestEmbeddedNowhereNw3GradeCore(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	origGuard := probeURLGuardEnabled
+	origTLS := probeHTTPClientTLS
+	probeURLGuardEnabled = false
+	t.Cleanup(func() {
+		probeURLGuardEnabled = origGuard
+		probeHTTPClientTLS = origTLS
+	})
+
+	dir := t.TempDir()
+	rt := newEmbeddedRuntime()
+
+	// 配置校验：非法 grade、morph=false 下的非法 grade 以及 nw2 指定 grade 都必须在 Test 阶段被拒收。
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "invalid-grade",
+			yaml: fmt.Sprintf("log-level: silent\nfind-process-mode: \"off\"\nlisteners:\n  - name: bad-grade-1\n    type: nowhere\n    listen: 127.0.0.1\n    port: 0\n    password: %s\n    grade: light\nrules:\n  - MATCH,DIRECT\n", trafficTestPassword),
+		},
+		{
+			name: "invalid-grade-morph-off",
+			yaml: fmt.Sprintf("log-level: silent\nfind-process-mode: \"off\"\nlisteners:\n  - name: bad-grade-2\n    type: nowhere\n    listen: 127.0.0.1\n    port: 0\n    password: %s\n    morph: false\n    grade: CORE\nrules:\n  - MATCH,DIRECT\n", trafficTestPassword),
+		},
+		{
+			name: "nw2-rejects-grade",
+			yaml: fmt.Sprintf("log-level: silent\nfind-process-mode: \"off\"\nlisteners:\n  - name: bad-grade-3\n    type: nowhere\n    listen: 127.0.0.1\n    port: 0\n    password: %s\n    alpn: [nw2]\n    grade: core\nrules:\n  - MATCH,DIRECT\n", trafficTestPassword),
+		},
+	} {
+		p := filepath.Join(dir, tc.name+".yaml")
+		if err := os.WriteFile(p, []byte(tc.yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.Test(context.Background(), p, dir); err == nil {
+			t.Fatalf("%s: expected Test to reject invalid nowhere grade config", tc.name)
+		}
+	}
+
+	sink, sinkPort := listenSink(t)
+	udpEcho, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = udpEcho.Close() })
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, rerr := udpEcho.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			_, _ = udpEcho.WriteTo(buf[:n], addr)
+		}
+	}()
+	udpEchoAddr := udpEcho.LocalAddr().(*net.UDPAddr)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(ts.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(ts.Certificate())
+	probeHTTPClientTLS = &tls.Config{RootCAs: pool}
+
+	tcpChaChaPort := freePort(t)
+	tcpAESPort := freePort(t)
+	udpAESPort := freeLoopbackDualPort(t)
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw3-core-chacha-tcp
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: tcp
+    morph: true
+    grade: core
+  - name: nw3-core-aes-tcp
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: tcp
+    morph: true
+    grade: core
+    cipher: aes
+  - name: nw3-core-aes-udp
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+    grade: core
+    cipher: aes
+rules:
+  - MATCH,DIRECT
+`, tcpChaChaPort, trafficTestPassword, tcpAESPort, trafficTestPassword, udpAESPort, trafficTestPassword)
+	cfgPath := filepath.Join(dir, "config-grade.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Test(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Test nw3 grade:core config failed: %v", err)
+	}
+	if err := rt.Start(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Start nw3 grade:core failed: %v", err)
+	}
+	t.Cleanup(rt.Stop)
+
+	const total int64 = 256 << 10
+	morphOn := true
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 1) TCP + grade: core + 默认 chacha 转发与精确计数。
+	tcpChaCha, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nw3-tcp-core-chacha", Server: "127.0.0.1", Port: tcpChaChaPort,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "tcp", Morph: &morphOn, Grade: "core",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tcpChaCha.Close() })
+	c1, err := tcpChaCha.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)})
+	if err != nil {
+		t.Fatalf("nw3 tcp grade:core chacha dial: %v", err)
+	}
+	writeUntilStop(t, c1, total)
+	_ = c1.Close()
+	waitSink(t, sink, total)
+	if got := counterValue("inbound>>>nw3-core-chacha-tcp>>>traffic>>>uplink"); got != total {
+		t.Fatalf("nw3-core-chacha-tcp uplink %d want %d counters %v", got, total, traffic.counters())
+	}
+
+	// 2) TCP + grade: core + cipher: aes 转发与精确计数。
+	tcpAES, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nw3-tcp-core-aes", Server: "127.0.0.1", Port: tcpAESPort,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "tcp", Morph: &morphOn, Grade: "core", Cipher: "aes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tcpAES.Close() })
+	c2, err := tcpAES.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)})
+	if err != nil {
+		t.Fatalf("nw3 tcp grade:core aes dial: %v", err)
+	}
+	writeUntilStop(t, c2, total)
+	_ = c2.Close()
+	waitSink(t, sink, total*2)
+	if got := counterValue("inbound>>>nw3-core-aes-tcp>>>traffic>>>uplink"); got != total {
+		t.Fatalf("nw3-core-aes-tcp uplink %d want %d counters %v", got, total, traffic.counters())
+	}
+
+	// 3) QUIC/UDP + grade: core + cipher: aes 流与数据报双向转发计数。
+	udpAES, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nw3-udp-core-aes", Server: "127.0.0.1", Port: udpAESPort,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "udp", Morph: &morphOn, Grade: "core", Cipher: "aes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = udpAES.Close() })
+	qConn, err := udpAES.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)})
+	if err != nil {
+		t.Fatalf("nw3 udp grade:core aes tcp-flow dial: %v", err)
+	}
+	writeUntilStop(t, qConn, total)
+	_ = qConn.Close()
+	waitSink(t, sink, total*3)
+
+	pc, err := udpAES.ListenPacketContext(ctx, &C.Metadata{
+		NetWork: C.UDP, DstIP: netip.MustParseAddr("127.0.0.1"), DstPort: uint16(udpEchoAddr.Port),
+	})
+	if err != nil {
+		t.Fatalf("nw3 udp grade:core aes udp-flow dial: %v", err)
+	}
+	const udpPayload = "nowhere-3.5-core-aes-datagram"
+	_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := pc.WriteTo([]byte(udpPayload), udpEchoAddr); err != nil {
+		_ = pc.Close()
+		t.Fatalf("nw3 udp write: %v", err)
+	}
+	rbuf := make([]byte, 256)
+	rn, _, err := pc.ReadFrom(rbuf)
+	_ = pc.Close()
+	if err != nil || string(rbuf[:rn]) != udpPayload {
+		t.Fatalf("nw3 udp echo mismatch: got %q err=%v", rbuf[:rn], err)
+	}
+	if got := counterValue("inbound>>>nw3-core-aes-udp>>>traffic>>>uplink"); got != total+int64(len(udpPayload)) {
+		t.Fatalf("nw3-core-aes-udp uplink %d want %d counters %v", got, total+int64(len(udpPayload)), traffic.counters())
+	}
+	if got := counterValue("inbound>>>nw3-core-aes-udp>>>traffic>>>downlink"); got < int64(len(udpPayload)) {
+		t.Fatalf("nw3-core-aes-udp downlink %d want >= %d counters %v", got, len(udpPayload), traffic.counters())
+	}
+
+	// 4) Morph Grade 不匹配（full 客户端连 core 服务端）在 TCP 与 QUIC 下均必须失败。
+	wrongTCP, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nw3-tcp-full-mismatch", Server: "127.0.0.1", Port: tcpAESPort,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "tcp", Morph: &morphOn, Grade: "full", Cipher: "aes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wrongTCP.Close() })
+	shortCtx, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer shortCancel()
+	if bad, err := wrongTCP.DialContext(shortCtx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)}); err == nil {
+		_ = bad.Close()
+		t.Fatal("expected mismatched morph grade (full vs core) on TCP to fail handshake")
+	}
+
+	wrongUDP, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nw3-udp-full-mismatch", Server: "127.0.0.1", Port: udpAESPort,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "udp", Morph: &morphOn, Grade: "full", Cipher: "aes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wrongUDP.Close() })
+	shortUDPCtx, shortUDPCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer shortUDPCancel()
+	if bad, err := wrongUDP.DialContext(shortUDPCtx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)}); err == nil {
+		_ = bad.Close()
+		t.Fatal("expected mismatched morph grade (full vs core) on QUIC to fail handshake")
+	}
+
+	// 5) probe.go 通过 adapter.ParseProxy 解析 grade: core + cipher: aes 并完成真实 URL 探测。
+	probeRes := executeProbe(ctx, probeRequest{
+		ID:           "nw3-core-aes-probe",
+		Host:         "127.0.0.1",
+		Port:         tcpAESPort,
+		AllowPrivate: true,
+		Proxy: map[string]any{
+			"name":             "probe-nw3-core-aes",
+			"type":             "nowhere",
+			"server":           "127.0.0.1",
+			"port":             tcpAESPort,
+			"password":         trafficTestPassword,
+			"alpn":             []string{"nw3"},
+			"net":              "tcp",
+			"morph":            true,
+			"grade":            "core",
+			"cipher":           "aes",
+			"skip-cert-verify": true,
+		},
+		LatencyURL: ts.URL + "/generate_204",
+	})
+	if probeRes.URLTest == nil || probeRes.URLTest.Status != "ok" || probeRes.URLTest.HTTPStatus != 204 {
+		t.Fatalf("expected nw3 grade:core+cipher:aes probe ok 204, got %+v", probeRes.URLTest)
+	}
+}
+
 // 验证 embeddedRuntime.Stop() 会一并释放 mihomo 全局 proxies/rules 与 geodata singleflight 缓存，
 // 避免切到 xray/sing-box 或整机停服后常驻几十 MiB 旧索引与出站对象。
 func TestEmbeddedStopReleasesTunnelAndGeoCache(t *testing.T) {

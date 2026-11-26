@@ -34,9 +34,9 @@ type Config struct {
 	XrayAPI    string
 	// MemoryLimit 是进程软内存上限，单位字节。0 表示不设，只在显式 off 时出现。
 	MemoryLimit int64
-	// NowhereEnv 是校验通过的 Nowhere 3.4 运行时调优变量（来自 agent.conf 或进程环境）。
+	// NowhereEnv 是校验通过的 Nowhere 3.5 运行时调优变量（来自 agent.conf 或进程环境）。
 	NowhereEnv map[string]string
-	// NowhereMemoryProfile 是生效的 Nowhere 3.4 QUIC 内存档位（显式优先，否则按 MemoryLimit 推导）。
+	// NowhereMemoryProfile 是生效的 Nowhere 3.5 QUIC 内存档位（显式优先，否则按 MemoryLimit 推导）。
 	NowhereMemoryProfile string
 
 	fromFile   bool
@@ -251,7 +251,7 @@ func parseByteCount(s string) (int64, bool) {
 	return int64(un), true
 }
 
-// Nowhere 3.4 运行时调优变量白名单，口径与 third_party/clash-meta-nw/transport/nowhere/core/runtime 对齐。
+// Nowhere 3.5 运行时调优变量白名单，口径与 third_party/clash-meta-nw/transport/nowhere/core/runtime 对齐。
 const (
 	nowhereEnvMemoryProfile = "NOW_TRANSPORT_MEMORY_PROFILE"
 	nowhereEnvMaxPortalIdle = 1023
@@ -278,7 +278,7 @@ var nowhereEnvKeys = []string{
 }
 
 // defaultNowhereMemoryProfile 在未显式指定 NOW_TRANSPORT_MEMORY_PROFILE 时，
-// 按 AGENT_MEMORY_LIMIT 推导匹配的 Nowhere 3.4 QUIC 窗口档位，避免 32MiB 默认窗口顶穿软上限。
+// 按 AGENT_MEMORY_LIMIT 推导匹配的 Nowhere 3.5 QUIC 窗口档位，避免 32MiB 默认窗口顶穿软上限。
 func defaultNowhereMemoryProfile(limit int64) string {
 	if limit <= 0 || limit > (1<<30) {
 		return "throughput"
@@ -373,7 +373,7 @@ func applyNowhereEnv(cfg Config) {
 			_ = os.Setenv(key, value)
 		} else {
 			// 未在生效配置中指定的白名单变量统一清掉（含空字符串占位与旧值残留），
-			// 防止 Nowhere 3.4 runtime.Load 拒收空值并保证多次应用幂等。
+			// 防止 Nowhere 3.5 runtime.Load 拒收空值并保证多次应用幂等。
 			_ = os.Unsetenv(key)
 		}
 	}
