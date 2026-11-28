@@ -222,6 +222,9 @@ func (s *session) open(ciphertext []byte) ([]byte, error) {
 }
 
 func (s *session) send(ctx context.Context, msg message) error {
+	if s == nil || s.conn == nil || s.gcmC2S == nil {
+		return errors.New("channel closed")
+	}
 	plain, err := json.Marshal(msg)
 	if err != nil {
 		return err

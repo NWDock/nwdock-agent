@@ -20,8 +20,9 @@ type execRuntime struct {
 	api     string
 	version string
 
-	mu  sync.Mutex
-	cmd *exec.Cmd
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	done chan struct{}
 }
 
 func newExecRuntime(kind coreKind, bin, api string) *execRuntime {
@@ -68,17 +69,24 @@ func (e *execRuntime) Start(ctx context.Context, configPath, dir string) error {
 	// 管道在核心退出时 EOF，两个 goroutine 自然收场。
 	go teeCoreOutput(e.kind, "stdout", os.Stdout, stdout)
 	go teeCoreOutput(e.kind, "stderr", os.Stderr, stderr)
+	done := make(chan struct{})
 	e.mu.Lock()
 	e.cmd = cmd
+	e.done = done
 	e.mu.Unlock()
 	e.version = probeVersion(ctx, e.bin, e.kind)
 	waitErr := make(chan error, 1)
-	go func() { waitErr <- cmd.Wait() }()
+	go func() {
+		err := cmd.Wait()
+		close(done)
+		waitErr <- err
+	}()
 	select {
 	case err := <-waitErr:
 		e.mu.Lock()
 		if e.cmd == cmd {
 			e.cmd = nil
+			e.done = nil
 		}
 		e.mu.Unlock()
 		if err != nil {
@@ -93,6 +101,7 @@ func (e *execRuntime) Start(ctx context.Context, configPath, dir string) error {
 		same := e.cmd == cmd
 		if same {
 			e.cmd = nil
+			e.done = nil
 		}
 		e.mu.Unlock()
 		if !same {
@@ -112,10 +121,19 @@ func (e *execRuntime) Start(ctx context.Context, configPath, dir string) error {
 func (e *execRuntime) Stop() {
 	e.mu.Lock()
 	cmd := e.cmd
+	done := e.done
 	e.cmd = nil
+	e.done = nil
 	e.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
+		if done != nil {
+			// 等待子进程退出回收 FD，避免紧随其后的重启抢绑旧端口报 address already in use。
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+			}
+		}
 	}
 }
 

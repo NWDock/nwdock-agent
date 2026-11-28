@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -218,5 +220,139 @@ func TestStageConfigSkipsUnchangedTest(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, coreStagingName(coreMihomo))); !os.IsNotExist(err) {
 		t.Fatalf("expected staging file not written on unchanged short-circuit, stat err=%v", err)
+	}
+}
+
+// 回归：端口在同一次 desired 变更里从核心入站让给入口/独立转发时，
+// applyDesired 必须在核心释放端口后立刻重试失败转发，不等下一次 15s 心跳。
+func TestApplyDesiredCoreToRelayPortHandoff(t *testing.T) {
+	dir := t.TempDir()
+	resetRelay(dir)
+	resetTraffic()
+	t.Cleanup(func() {
+		Shutdown()
+		resetTraffic()
+		proc.mu.Lock()
+		proc.generation = 0
+		proc.loaded = false
+		proc.lastDesired = nil
+		proc.mu.Unlock()
+	})
+	proc.mu.Lock()
+	proc.rt = nil
+	proc.core = ""
+	proc.version = ""
+	proc.generation = 0
+	proc.loaded = false
+	proc.mu.Unlock()
+
+	portP := freeDualPort(t)
+	portQ := freeDualPort(t)
+	sink := echoSink(t)
+	s := &session{cfg: Config{Runtime: "service", DataDir: dir}}
+
+	mkMihomo := func(port int) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{
+			"log-level":"silent",
+			"find-process-mode":"off",
+			"listeners":[{"name":"nw-%d","type":"nowhere","listen":"0.0.0.0","port":%d,"password":"%s","alpn":["nw3"],"net":"udp","morph":true}],
+			"rules":["MATCH,DIRECT"]
+		}`, port, port, trafficTestPassword))
+	}
+
+	// 世代 1：核心占着 portP（UDP）。
+	d1, err := json.Marshal(desiredBody{
+		Generation: 1,
+		Serving:    true,
+		Core:       "mihomo",
+		Config:     mkMihomo(portP),
+		Forwards:   []forwardDesired{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.applyDesired(context.Background(), d1); err != nil {
+		t.Fatalf("applyDesired gen 1: %v", err)
+	}
+
+	// 世代 2：核心改听 portQ，同时独立转发接管 portP（TCP+UDP）。
+	// relayApplyAll 先执行会短暂撞上核心占着的 portP，核心切换完成后必须立即自愈。
+	d2, err := json.Marshal(desiredBody{
+		Generation: 2,
+		Serving:    true,
+		Core:       "mihomo",
+		Config:     mkMihomo(portQ),
+		Forwards: []forwardDesired{{
+			ID:           "fwd-handoff",
+			Port:         portP,
+			TargetHost:   "127.0.0.1",
+			TargetPort:   sink,
+			TCP:          true,
+			UDP:          true,
+			AllowPrivate: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.applyDesired(context.Background(), d2); err != nil {
+		t.Fatalf("applyDesired gen 2: %v", err)
+	}
+
+	// 直接检查引擎状态（不借助 relayHeartbeatStates 内的重试），必须已经监听成功。
+	relayEng.mu.Lock()
+	h := relayEng.handles[relayForwardKey("fwd-handoff")]
+	if h == nil || h.err != "" {
+		relayEng.mu.Unlock()
+		t.Fatalf("expected forward on port %d recovered immediately after core handoff, got %+v", portP, h)
+	}
+	relayEng.mu.Unlock()
+
+	// 世代 3：整机停服（serving=false），同时把核心刚释放的 portQ 交给入口转发。
+	d3, err := json.Marshal(desiredBody{
+		Generation: 3,
+		Serving:    false,
+		Core:       "mihomo",
+		Relays:     []relaySpec{{Port: portQ, TargetHost: "127.0.0.1", TargetPort: sink, TCP: true, UDP: true}},
+		Forwards:   []forwardDesired{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.applyDesired(context.Background(), d3); err != nil {
+		t.Fatalf("applyDesired gen 3: %v", err)
+	}
+
+	relayEng.mu.Lock()
+	h2 := relayEng.handles[relayPortKey(portQ)]
+	if h2 == nil || h2.err != "" {
+		relayEng.mu.Unlock()
+		t.Fatalf("expected legacy relay on port %d recovered immediately after core stop, got %+v", portQ, h2)
+	}
+	relayEng.mu.Unlock()
+}
+
+// 回归：execRuntime.Stop() 必须等被杀子进程真正退出回收 FD 再返回，避免重启立刻抢绑端口失败。
+func TestExecRuntimeStopWaitsForProcessExit(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sh sleep: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+
+	rt := &execRuntime{kind: coreXray, cmd: cmd, done: done}
+	rt.Stop()
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("execRuntime.Stop returned before child process exited")
+	}
+	if rt.Running() {
+		t.Fatal("execRuntime.Running must be false after Stop")
 	}
 }

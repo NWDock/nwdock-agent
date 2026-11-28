@@ -593,6 +593,12 @@ func relayApplyAll(dir string, legacy, forwards []relaySpec) error {
 	return relayEng.applyAll(legacy, forwards)
 }
 
+// relayRetryFailed 在核心释放端口或停服后立即重试此前打开失败的转发条目，
+// 避免端口从核心让给转发时拖到下一次 15s 心跳才恢复、期间误报监听失败。
+func relayRetryFailed() {
+	relayEng.retryFailed()
+}
+
 // relayHeartbeatStates 输出心跳上报用的状态：失败优先、最多 relayMaxStates 条，
 // total/truncated 让面板看到被截断的全量。独立转发条目带 forward_id。
 func relayHeartbeatStates() (states []relayPortState, total int, truncated bool) {
@@ -643,50 +649,81 @@ func relayStateList(handles map[string]*relayHandle) []relayPortState {
 }
 
 // retryFailed 重试上次没打开成功的条目：瞬时冲突（如核心重启还没让出端口）恢复后自动补上。
+// 先统一关闭全部失败条目的残余句柄再统一重开，且不做额外阻塞重试以免真正被占用的端口拖慢心跳。
 func (e *relayEngine) retryFailed() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	type retryItem struct {
+		key  string
+		spec relaySpec
+	}
+	var pending []retryItem
 	for key, h := range e.handles {
 		if h.err == "" {
 			continue
 		}
 		e.closeHandleLocked(h, false)
-		e.handles[key] = e.openLocked(h.spec)
+		delete(e.handles, key)
+		pending = append(pending, retryItem{key: key, spec: h.spec})
+	}
+	for _, item := range pending {
+		e.handles[item.key] = e.openLocked(item.spec, nil)
 	}
 }
 
 // apply 只收敛 legacy 清单，不触碰独立转发：旧面板的 desired 没有 forwards 段。
 func (e *relayEngine) apply(legacy []relaySpec) error {
 	e.mu.Lock()
-	wake, err := e.applyLegacyLocked(legacy)
+	want := buildLegacyWant(legacy)
+	if err := e.persistWantLocked(&e.persist, want, writeRelayWant); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	wake := e.reconcileDomainsLocked([]relayDomainWant{{forwardDomain: false, want: want}})
 	e.mu.Unlock()
-	if err == nil && wake {
+	if wake {
 		relayWakeStats()
 	}
-	return err
+	return nil
 }
 
 // applyAll 同时收敛 legacy 与独立转发。任一份清单落盘失败就整体返回错误：
 // 调用方据此不确认世代，面板下一轮重推，运行时保持上一份已验证的清单。
+// 两份清单落盘后再跨两个域统一「先全关、后全开」，避免端口在入口转发与独立/多链转发之间
+// 迁移或两条独立转发互换端口时因随机 map 遍历顺序触发 address already in use。
 func (e *relayEngine) applyAll(legacy, forwards []relaySpec) error {
 	e.mu.Lock()
-	wakeLegacy, err := e.applyLegacyLocked(legacy)
-	if err != nil {
+	legacyWant := buildLegacyWant(legacy)
+	fwdWant := buildForwardWant(forwards)
+	if err := e.persistWantLocked(&e.persist, legacyWant, writeRelayWant); err != nil {
 		e.mu.Unlock()
 		return err
 	}
-	wakeForwards, err := e.applyForwardsLocked(forwards)
+	if err := e.persistWantLocked(&e.fwdPersist, fwdWant, writeForwardWant); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	retired := e.trackForwardRetireLocked(fwdWant)
+	removed := e.reconcileDomainsLocked([]relayDomainWant{
+		{forwardDomain: false, want: legacyWant},
+		{forwardDomain: true, want: fwdWant},
+	})
 	e.mu.Unlock()
-	if err == nil && (wakeLegacy || wakeForwards) {
+	if retired || removed {
 		relayWakeStats()
 	}
-	return err
+	return nil
 }
 
 // isForward 报告 handle 属于哪个域：独立转发按 forward id 收敛，legacy 按入口端口。
 func (h *relayHandle) isForward() bool { return h.spec.ForwardID != "" }
 
-func (e *relayEngine) applyLegacyLocked(specs []relaySpec) (bool, error) {
+type relayDomainWant struct {
+	forwardDomain bool
+	want          map[string]relaySpec
+}
+
+func buildLegacyWant(specs []relaySpec) map[string]relaySpec {
 	want := map[string]relaySpec{}
 	for _, sp := range specs {
 		if sp.ForwardID != "" || !sp.valid() {
@@ -697,14 +734,10 @@ func (e *relayEngine) applyLegacyLocked(specs []relaySpec) (bool, error) {
 		}
 		want[relayPortKey(sp.Port)] = sp
 	}
-	// 先落盘再切运行时：落盘失败时运行中的清单不动，调用方不确认世代。
-	if err := e.persistWantLocked(&e.persist, want, writeRelayWant); err != nil {
-		return false, err
-	}
-	return e.reconcileLocked(false, want), nil
+	return want
 }
 
-func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) (bool, error) {
+func buildForwardWant(forwards []relaySpec) map[string]relaySpec {
 	want := map[string]relaySpec{}
 	for _, sp := range forwards {
 		if !sp.validForward() {
@@ -716,12 +749,12 @@ func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) (bool, error) {
 		}
 		want[key] = sp
 	}
-	// 先落盘再切运行时：落盘失败时运行中的清单不动，调用方不确认世代。
-	if err := e.persistWantLocked(&e.fwdPersist, want, writeForwardWant); err != nil {
-		return false, err
-	}
-	// 本批消失的 id 进退休队列：累计计数保留到面板 stats_ack 确认后才丢，
-	// 否则删除前最后一笔字节会随条目一起蒸发。重新启用的 id 从退休队列摘除。
+	return want
+}
+
+// trackForwardRetireLocked 记录本批消失的独立转发 id 进退休队列：累计计数保留到面板
+// stats_ack 确认后才丢，否则删除前最后一笔字节会随条目一起蒸发。重新启用的 id 从退休队列摘除。
+func (e *relayEngine) trackForwardRetireLocked(want map[string]relaySpec) bool {
 	retired := false
 	for id := range e.liveForwards {
 		if _, ok := want[relayForwardKey(id)]; !ok {
@@ -734,75 +767,126 @@ func (e *relayEngine) applyForwardsLocked(forwards []relaySpec) (bool, error) {
 		e.liveForwards[sp.ForwardID] = true
 		delete(e.retiredForwards, sp.ForwardID)
 	}
-	removed := e.reconcileLocked(true, want)
-	return retired || removed, nil
+	return retired
 }
 
-// reconcileLocked 把一个域的 handles 收敛到 want：只触碰本域，另一域不受影响。
-// 缺失的撤销，规格没变的保持，同键变化时按 TCP/UDP 开关是否变化决定是否断掉已建立的
-// TCP 会话。返回值表示是否有既有 handle 被撤销移除。
-func (e *relayEngine) reconcileLocked(forwardDomain bool, want map[string]relaySpec) bool {
-	removed := false
-	for key, h := range e.handles {
-		if h.isForward() != forwardDomain {
-			continue
-		}
-		if _, ok := want[key]; ok {
-			continue
-		}
-		e.closeHandleLocked(h, false)
-		delete(e.handles, key)
-		removed = true
+// reconcileDomainsLocked 把指定域的 handles 两阶段收敛到 want：
+// 阶段 1 先关闭全部待删与待重建的旧监听（未变条目不动）；
+// 阶段 2 再统一打开全部新增与重建条目，并按 TCP/UDP 开关决定是否沿用已建立的 TCP 会话。
+// 返回值表示是否有既有 handle 被撤销移除。
+func (e *relayEngine) reconcileDomainsLocked(domains []relayDomainWant) bool {
+	type prevEntry struct {
+		handle *relayHandle
+		keep   bool
 	}
-	for key, sp := range want {
-		h, ok := e.handles[key]
-		if ok && h.err == "" && h.spec == sp {
+	wantByDomain := map[bool]map[string]relaySpec{}
+	for _, d := range domains {
+		wantByDomain[d.forwardDomain] = d.want
+	}
+	unchanged := map[string]bool{}
+	prev := map[string]prevEntry{}
+	removed := false
+	closedAny := false
+	for key, h := range e.handles {
+		want, managed := wantByDomain[h.isForward()]
+		if !managed {
+			continue
+		}
+		sp, ok := want[key]
+		if !ok {
+			e.closeHandleLocked(h, false)
+			delete(e.handles, key)
+			removed = true
+			closedAny = true
+			continue
+		}
+		if h.err == "" && h.spec == sp {
+			unchanged[key] = true
 			continue // 无变化：监听器与已建立的连接都保持
 		}
-		keep := false
-		if ok {
-			// 同键存在：仅换目标或只动 UDP 开关时保留已建立的 TCP 会话，新连接走新目标；
-			// TCP 开关变化、或 allow_private 被收紧（放开→收紧）都必须断掉旧会话，
-			// 否则已放行的内网连接会留在收紧后的策略外。
-			keep = sp.TCP && h.spec.TCP && !(h.spec.AllowPrivate && !sp.AllowPrivate)
-			e.closeHandleLocked(h, keep)
-		}
-		nh := e.openLocked(sp)
-		if keep {
-			for s := range h.sessions {
-				s.h = nh
-				nh.sessions[s] = struct{}{}
+		// 同键存在：仅换目标或只动 UDP 开关时保留已建立的 TCP 会话，新连接走新目标；
+		// TCP 开关变化、或 allow_private 被收紧（放开→收紧）都必须断掉旧会话，
+		// 否则已放行的内网连接会留在收紧后的策略外。
+		keep := sp.TCP && h.spec.TCP && !(h.spec.AllowPrivate && !sp.AllowPrivate)
+		e.closeHandleLocked(h, keep)
+		delete(e.handles, key)
+		prev[key] = prevEntry{handle: h, keep: keep}
+		closedAny = true
+	}
+	var budget time.Duration
+	var budgetPtr *time.Duration
+	if closedAny {
+		budget = relayBindRetryBudget
+		budgetPtr = &budget
+	}
+	for _, d := range domains {
+		for key, sp := range d.want {
+			if unchanged[key] {
+				continue
 			}
-			h.sessions = nil
+			nh := e.openLocked(sp, budgetPtr)
+			if p, ok := prev[key]; ok && p.keep {
+				for s := range p.handle.sessions {
+					s.h = nh
+					nh.sessions[s] = struct{}{}
+				}
+				p.handle.sessions = nil
+			}
+			e.handles[key] = nh
 		}
-		e.handles[key] = nh
 	}
 	return removed
 }
 
 // openLocked 打开一条转发的监听；失败只记录在该条目上，不影响其它条目。
-func (e *relayEngine) openLocked(sp relaySpec) *relayHandle {
+// 若 TCP 与 UDP 仅一侧成功、另一侧失败，则立刻关闭已打开的半开监听，不留残余端口占用。
+func (e *relayEngine) openLocked(sp relaySpec, budget *time.Duration) *relayHandle {
 	h := &relayHandle{spec: sp, sessions: map[*relayTCPSession]struct{}{}}
 	addr := net.JoinHostPort("", strconv.Itoa(sp.Port))
 	if sp.TCP {
-		ln, err := net.Listen("tcp", addr)
+		var ln net.Listener
+		err := retryOnAddrInUse(budget, func() error {
+			var lerr error
+			ln, lerr = net.Listen("tcp", addr)
+			return lerr
+		})
 		if err != nil {
 			h.err = joinRelayErr(h.err, "tcp: "+err.Error())
 		} else {
 			h.tcp = ln
-			go e.serveTCP(ln, h)
 		}
 	}
 	if sp.UDP {
-		pc, err := net.ListenPacket("udp", addr)
+		var pc net.PacketConn
+		err := retryOnAddrInUse(budget, func() error {
+			var lerr error
+			pc, lerr = net.ListenPacket("udp", addr)
+			return lerr
+		})
 		if err != nil {
 			h.err = joinRelayErr(h.err, "udp: "+err.Error())
 		} else {
 			udpCtx, udpCancel := context.WithCancel(context.Background())
 			h.udp = &relayUDP{pc: pc, sessions: map[string]*relayUDPSession{}, ctx: udpCtx, cancel: udpCancel, fwd: sp.ForwardID}
-			go e.serveUDP(h.udp, sp)
-			go h.udp.sweep()
 		}
+	}
+	if h.err != "" {
+		if h.tcp != nil {
+			_ = h.tcp.Close()
+			h.tcp = nil
+		}
+		if h.udp != nil {
+			h.udp.close()
+			h.udp = nil
+		}
+		return h
+	}
+	if h.tcp != nil {
+		go e.serveTCP(h.tcp, h)
+	}
+	if h.udp != nil {
+		go e.serveUDP(h.udp, sp)
+		go h.udp.sweep()
 	}
 	return h
 }

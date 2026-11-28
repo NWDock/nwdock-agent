@@ -3,13 +3,18 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/observable"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/config"
@@ -20,6 +25,74 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
+
+const (
+	embedBindRetryBudget = 500 * time.Millisecond
+	relayBindRetryBudget = 500 * time.Millisecond
+)
+
+var bindRetryDelays = []time.Duration{
+	10 * time.Millisecond,
+	20 * time.Millisecond,
+	40 * time.Millisecond,
+	80 * time.Millisecond,
+	100 * time.Millisecond,
+}
+
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
+}
+
+// retryOnAddrInUse 在端口刚释放出现瞬时 EADDRINUSE 时做有界退避重试；
+// 预算耗尽或遇到非占用错误立即返回，避免误配大量冲突端口时拖慢整批应用。
+func retryOnAddrInUse(budget *time.Duration, fn func() error) error {
+	err := fn()
+	if err == nil || budget == nil || *budget <= 0 || !isAddrInUse(err) {
+		return err
+	}
+	for _, d := range bindRetryDelays {
+		if *budget <= 0 {
+			break
+		}
+		wait := d
+		if wait > *budget {
+			wait = *budget
+		}
+		*budget -= wait
+		time.Sleep(wait)
+		err = fn()
+		if err == nil || !isAddrInUse(err) {
+			return err
+		}
+	}
+	return err
+}
+
+func listenInboundWithRetry(build func() (C.InboundListener, error), budget *time.Duration) (C.InboundListener, error) {
+	var opened C.InboundListener
+	err := retryOnAddrInUse(budget, func() error {
+		lis, err := build()
+		if err != nil {
+			return err
+		}
+		if err := lis.Listen(meterTunnel{}); err != nil {
+			closeInboundListener(lis)
+			return err
+		}
+		opened = lis
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return opened, nil
+}
 
 // embeddedRuntime 把 clash-meta-nw 跑在 agent 进程里。监听器由本进程持有，
 // 交给 meterTunnel 计数；出站、规则和 DNS 仍由 executor.ApplyConfig 更新。
@@ -156,6 +229,36 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 			sharedSS[item.Tag] = item
 		}
 	}
+	// 两阶段切换监听器：先识别可复用条目并关闭全部待删/换名/改配/换证旧监听，
+	// 再打开新监听，避免同端口换 tag（如 nw2↔nw3、换用户/协议）或互换端口时报 address already in use。
+	reuse := make(map[string]bool, len(e.listeners))
+	for name, old := range e.listeners {
+		lis, exists := listeners[name]
+		if !exists {
+			continue
+		}
+		if _, isSharedSS := sharedSS[name]; isSharedSS {
+			if ssOpt, ok := lis.Config().(*IN.ShadowSocksOption); ok {
+				if oldSS, ok := old.(*embeddedSSListener); ok && oldSS.Config() != nil && oldSS.Config().Equal(ssOpt) {
+					reuse[name] = true
+				}
+				continue
+			}
+		}
+		_, oldWasSharedSS := old.(*embeddedSSListener)
+		if !oldWasSharedSS && !filesChanged && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
+			reuse[name] = true
+		}
+	}
+	for name, old := range e.listeners {
+		if reuse[name] {
+			continue
+		}
+		traffic.closeInbound(name)
+		closeInboundListener(old)
+		delete(e.listeners, name)
+	}
+	retryBudget := embedBindRetryBudget
 	rollbackOpened := func(next map[string]C.InboundListener) {
 		for n, opened := range next {
 			if opened != e.listeners[n] {
@@ -168,7 +271,8 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 		old := e.listeners[name]
 		if spec, isSharedSS := sharedSS[name]; isSharedSS {
 			if ssOpt, ok := lis.Config().(*IN.ShadowSocksOption); ok {
-				if oldSS, ok := old.(*embeddedSSListener); ok && oldSS.Config() != nil && oldSS.Config().Equal(ssOpt) {
+				if reuse[name] {
+					oldSS := old.(*embeddedSSListener)
 					dropped, err := oldSS.UpdateUsers(spec.Users)
 					if err != nil {
 						rollbackOpened(next)
@@ -178,18 +282,10 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 					next[name] = oldSS
 					continue
 				}
-				if old != nil {
-					traffic.closeInbound(name)
-					closeInboundListener(old)
-					delete(e.listeners, name)
-				}
-				multiLis, err := newEmbeddedSSListener(ssOpt, spec.Users)
+				multiLis, err := listenInboundWithRetry(func() (C.InboundListener, error) {
+					return newEmbeddedSSListener(ssOpt, spec.Users)
+				}, &retryBudget)
 				if err != nil {
-					rollbackOpened(next)
-					return fmt.Errorf("build shared ss %s: %w", name, err)
-				}
-				if err := multiLis.Listen(meterTunnel{}); err != nil {
-					closeInboundListener(multiLis)
 					rollbackOpened(next)
 					return fmt.Errorf("listen %s: %w", name, err)
 				}
@@ -197,29 +293,19 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 				continue
 			}
 		}
-		_, oldWasSharedSS := old.(*embeddedSSListener)
-		if old != nil && !oldWasSharedSS && !filesChanged && old.Config() != nil && lis.Config() != nil && old.Config().Equal(lis.Config()) {
+		if reuse[name] {
 			next[name] = old
 			continue
 		}
-		if old != nil {
-			traffic.closeInbound(name)
-			closeInboundListener(old)
-			delete(e.listeners, name)
-		}
-		if err := lis.Listen(meterTunnel{}); err != nil {
-			closeInboundListener(lis)
+		targetLis := lis
+		opened, err := listenInboundWithRetry(func() (C.InboundListener, error) {
+			return targetLis, nil
+		}, &retryBudget)
+		if err != nil {
 			rollbackOpened(next)
 			return fmt.Errorf("listen %s: %w", name, err)
 		}
-		next[name] = lis
-	}
-	for name, old := range e.listeners {
-		if _, ok := next[name]; ok {
-			continue
-		}
-		traffic.closeInbound(name)
-		closeInboundListener(old)
+		next[name] = opened
 	}
 	e.listeners = next
 	e.running.Store(true)
@@ -229,6 +315,8 @@ func (e *embeddedRuntime) Apply(_ context.Context, configPath, dir string, _ map
 
 func (e *embeddedRuntime) Stop() {
 	wasRunning := e.running.Swap(false)
+	// 先把隧道切到 Suspend 挡住新连接，避免关监听瞬间在途流量进入路由匹配。
+	tunnel.OnSuspend()
 	if e.logSub != nil {
 		mihomolog.UnSubscribe(e.logSub)
 		e.logSub = nil
@@ -242,10 +330,16 @@ func (e *embeddedRuntime) Stop() {
 		_ = c.Close()
 		return true
 	})
-	// 释放全局 proxies/rules/sniffer 与 geo 匹配缓存，切到 xray/sing-box 或整机停服后
-	// 不把旧出站协议栈和几十 MiB GeoSite/GeoIP 索引留在进程堆里；不调 executor.Shutdown
-	// 以免触碰 iptables 或磁盘 cache.db。
-	tunnel.UpdateProxies(nil, nil)
+	// 释放全局业务 proxies/rules/sniffer 与 geo 匹配缓存，切到 xray/sing-box 或整机停服后
+	// 不把旧出站协议栈和几十 MiB GeoSite/GeoIP 索引留在进程堆里；保留最小内置 REJECT 占位
+	// （DIRECT/REJECT/GLOBAL）避免已越过 isHandle 的在途 TCP/UDP 协程拿到 nil proxy 触发空指针 panic。
+	// 不调 executor.Shutdown 以免触碰 iptables 或磁盘 cache.db。
+	reject := adapter.NewProxy(outbound.NewReject())
+	tunnel.UpdateProxies(map[string]C.Proxy{
+		"DIRECT": reject,
+		"REJECT": reject,
+		"GLOBAL": reject,
+	}, nil)
 	tunnel.UpdateRules(nil, nil, nil)
 	tunnel.UpdateSniffer(nil)
 	geodata.ClearGeoSiteCache()

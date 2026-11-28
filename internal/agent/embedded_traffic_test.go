@@ -1333,8 +1333,21 @@ rules:
 
 	rt.Stop()
 
-	if len(tunnel.Proxies()) != 0 {
-		t.Fatalf("expected tunnel.Proxies() empty after Stop, got %d", len(tunnel.Proxies()))
+	if tunnel.Status() != tunnel.Suspend {
+		t.Fatalf("expected tunnel suspended after Stop, got %v", tunnel.Status())
+	}
+	if _, ok := tunnel.Proxies()["direct-out"]; ok {
+		t.Fatal("expected custom outbound direct-out released after Stop")
+	}
+	for name, p := range tunnel.Proxies() {
+		if p == nil || p.Type() != C.Reject {
+			t.Fatalf("expected only built-in Reject fallback proxies after Stop, got %q=%v", name, p)
+		}
+	}
+	for _, required := range []string{"DIRECT", "REJECT", "GLOBAL"} {
+		if p := tunnel.Proxies()[required]; p == nil || p.Type() != C.Reject {
+			t.Fatalf("expected built-in Reject fallback for %s after Stop, got %v", required, p)
+		}
 	}
 	if len(tunnel.Rules()) != 0 {
 		t.Fatalf("expected tunnel.Rules() empty after Stop, got %d", len(tunnel.Rules()))
@@ -1560,4 +1573,295 @@ rules:
 	if rt.listeners["nw-cert"] == first {
 		t.Fatal("expected listener to be recreated when filesChanged=true")
 	}
+}
+
+// 回归：embeddedRuntime.Stop() 后若仍有已越过 isHandle() 的在途 TCP/UDP 协程进入
+// tunnel.handleTCPConn / handleUDPConn，不得因 proxies["DIRECT"] 为 nil 触发空指针 panic。
+func TestEmbeddedStopNoPanicOnInFlightTunnelConn(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	dir := t.TempDir()
+	port := freePort(t)
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-stop-safe
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: tcp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, port, trafficTestPassword)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	rt.Stop()
+	t.Cleanup(tunnel.OnSuspend)
+
+	// 模拟已越过 isHandle() 门禁的在途 TCP 协程：在 Stop() 后的代理表状态下走完整 handleTCPConn。
+	tunnel.OnRunning()
+	cli, srv := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tunnel.Tunnel.HandleTCPConn(srv, &C.Metadata{
+			NetWork: C.TCP,
+			Type:    C.SOCKS5,
+			SrcIP:   netip.MustParseAddr("127.0.0.1"),
+			SrcPort: 12345,
+			DstIP:   netip.MustParseAddr("127.0.0.1"),
+			DstPort: 80,
+		})
+	}()
+	_ = cli.SetDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	_, _ = cli.Read(buf)
+	_ = cli.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight HandleTCPConn after Stop did not finish")
+	}
+
+	// 同理验证停服后在途 UDP 包由内置 Reject 安全收束，不触发空指针 panic。
+	dropped := make(chan struct{}, 1)
+	pkt := &testDummyUDPPacket{data: []byte("ping"), dropped: dropped}
+	tunnel.Tunnel.HandleUDPPacket(pkt, &C.Metadata{
+		NetWork: C.UDP,
+		Type:    C.SOCKS5,
+		SrcIP:   netip.MustParseAddr("127.0.0.1"),
+		SrcPort: 23456,
+		DstIP:   netip.MustParseAddr("127.0.0.1"),
+		DstPort: 53,
+	})
+	select {
+	case <-dropped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight HandleUDPPacket after Stop was not dropped")
+	}
+}
+
+type testDummyUDPPacket struct {
+	data    []byte
+	dropped chan struct{}
+	once    sync.Once
+}
+
+func (p *testDummyUDPPacket) Data() []byte                            { return p.data }
+func (p *testDummyUDPPacket) WriteBack([]byte, net.Addr) (int, error) { return 0, io.EOF }
+func (p *testDummyUDPPacket) Drop()                                   { p.once.Do(func() { p.dropped <- struct{}{} }) }
+func (p *testDummyUDPPacket) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 23456}
+}
+
+func freeDualPort(t *testing.T) int {
+	t.Helper()
+	for range 32 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		pc, uerr := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		_ = ln.Close()
+		if uerr == nil {
+			_ = pc.Close()
+			return port
+		}
+	}
+	t.Fatal("could not allocate free tcp+udp port")
+	return 0
+}
+
+// 回归：embeddedRuntime.Apply 必须先关闭待删/换名/换端口旧监听再打开新监听，
+// 覆盖同端口换 tag（如 nw2 单监听切 nw3 TCP+UDP 双监听）与两监听互换端口。
+func TestEmbeddedApplyPortRenameAndSwapNoConflict(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	dir := t.TempDir()
+	portA := freeDualPort(t)
+	portB := freeDualPort(t)
+	sink, sinkPort := listenSink(t)
+
+	writeCfg := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// 初始：portA 跑 nw2（同时占 TCP+UDP），portB 跑 nw3 UDP。
+	cfg1 := writeCfg("step1.yaml", fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-v2-a
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw2]
+  - name: nw-v3-b
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, portA, trafficTestPassword, portB, trafficTestPassword))
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), cfg1, dir); err != nil {
+		t.Fatalf("Start step1 failed: %v", err)
+	}
+	t.Cleanup(rt.Stop)
+
+	// 切到 step2：portA 从 nw2 单 tag 换成 nw3 的 -t 与 -u 两个新 tag，portB 也换成新 tag。
+	cfg2 := writeCfg("step2.yaml", fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-v3-a-t
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: tcp
+    morph: true
+  - name: nw-v3-a-u
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+  - name: nw-v3-b-renamed
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, portA, trafficTestPassword, portA, trafficTestPassword, portB, trafficTestPassword))
+
+	if err := rt.Apply(context.Background(), cfg2, dir, nil, "", nil, false, false); err != nil {
+		t.Fatalf("Apply step2 (tag rename on same UDP/TCP ports) failed: %v", err)
+	}
+
+	// 同名两监听互换端口多轮重复，确保不依赖 Go map 遍历顺序。
+	for i := range 6 {
+		p1, p2 := portA, portB
+		if i%2 == 1 {
+			p1, p2 = portB, portA
+		}
+		swapCfg := writeCfg(fmt.Sprintf("swap-%d.yaml", i), fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-swap-1
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+  - name: nw-swap-2
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, p1, trafficTestPassword, p2, trafficTestPassword))
+		if err := rt.Apply(context.Background(), swapCfg, dir, nil, "", nil, false, false); err != nil {
+			t.Fatalf("Apply swap #%d failed: %v", i, err)
+		}
+	}
+
+	// 验证最终 UDP/QUIC 监听可正常转发真实流量。
+	morphOn := true
+	cli, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "c-swap", Server: "127.0.0.1", Port: portB,
+		Password: trafficTestPassword, SkipCertVerify: true,
+		ALPN: []string{"nw3"}, Net: "udp", Morph: &morphOn,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := cli.DialContext(ctx, &C.Metadata{Host: "127.0.0.1", DstPort: uint16(sinkPort)})
+	if err != nil {
+		t.Fatalf("dial after port swap failed: %v", err)
+	}
+	writeUntilStop(t, conn, 64<<10)
+	_ = conn.Close()
+	waitSink(t, sink, 64<<10)
+}
+
+// 回归：端口刚被短暂占用并于几十毫秒内释放时，embeddedRuntime.Apply 应通过有界退避重试成功监听。
+func TestEmbeddedApplyTransientAddrInUseRetries(t *testing.T) {
+	resetTraffic()
+	t.Cleanup(resetTraffic)
+
+	dir := t.TempDir()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+
+	cfgPath := filepath.Join(dir, "transient.yaml")
+	cfg := fmt.Sprintf(`log-level: silent
+find-process-mode: "off"
+listeners:
+  - name: nw-transient
+    type: nowhere
+    listen: 127.0.0.1
+    port: %d
+    password: %s
+    alpn: [nw3]
+    net: udp
+    morph: true
+rules:
+  - MATCH,DIRECT
+`, port, trafficTestPassword)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		_ = pc.Close()
+	}()
+
+	rt := newEmbeddedRuntime()
+	if err := rt.Start(context.Background(), cfgPath, dir); err != nil {
+		t.Fatalf("Start should succeed after transient UDP EADDRINUSE clears: %v", err)
+	}
+	rt.Stop()
 }

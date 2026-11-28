@@ -638,3 +638,130 @@ func TestRelayUDPZeroIdleBufferAndLargeDatagram(t *testing.T) {
 	}
 	t.Fatalf("UDP relay goroutines did not exit after stop: before=%d after=%d", baseG, runtime.NumGoroutine())
 }
+
+// 回归：独立转发之间互换端口，以及端口在独立转发与入口转发（legacy）之间迁移时，
+// applyAll 必须先跨两域关闭旧监听再打开新监听，不得因随机 map 遍历或先开后关报 address already in use。
+func TestRelayForwardPortSwapAndCrossDomainHandoff(t *testing.T) {
+	resetRelay(t.TempDir())
+	t.Cleanup(relayStop)
+
+	tcpSink := echoSink(t)
+	udpSink := udpEchoSink(t)
+	portA := freeDualRelayPort(t)
+	portB := freeDualRelayPort(t)
+
+	// 1) 两条独立转发连续 8 轮互换 TCP+UDP 端口，每轮都必须立即全部在听且无错。
+	for i := range 8 {
+		p1, p2 := portA, portB
+		if i%2 == 1 {
+			p1, p2 = portB, portA
+		}
+		if err := relayEng.applyAll(nil, []relaySpec{
+			{ForwardID: "fwd-a", Port: p1, TargetHost: "127.0.0.1", TargetPort: tcpSink, TCP: true, UDP: true, AllowPrivate: true},
+			{ForwardID: "fwd-b", Port: p2, TargetHost: "127.0.0.1", TargetPort: udpSink, TCP: true, UDP: true, AllowPrivate: true},
+		}); err != nil {
+			t.Fatalf("applyAll swap #%d: %v", i, err)
+		}
+		relayEng.mu.Lock()
+		for _, id := range []string{"fwd-a", "fwd-b"} {
+			h := relayEng.handles[relayForwardKey(id)]
+			if h == nil || h.err != "" {
+				relayEng.mu.Unlock()
+				t.Fatalf("swap #%d forward %s failed: %+v", i, id, h)
+			}
+		}
+		relayEng.mu.Unlock()
+	}
+
+	// 2) 跨域迁移：portA 从 forwards 移到 legacy，portB 从 forwards 保留；随后反向迁移。
+	if err := relayEng.applyAll(
+		[]relaySpec{{Port: portA, TargetHost: "127.0.0.1", TargetPort: tcpSink, TCP: true, UDP: true}},
+		[]relaySpec{{ForwardID: "fwd-b", Port: portB, TargetHost: "127.0.0.1", TargetPort: udpSink, TCP: true, UDP: true, AllowPrivate: true}},
+	); err != nil {
+		t.Fatalf("applyAll forwards->legacy: %v", err)
+	}
+	relayEng.mu.Lock()
+	if h := relayEng.handles[relayPortKey(portA)]; h == nil || h.err != "" {
+		relayEng.mu.Unlock()
+		t.Fatalf("legacy portA after forwards->legacy failed: %+v", h)
+	}
+	relayEng.mu.Unlock()
+
+	if err := relayEng.applyAll(
+		nil,
+		[]relaySpec{{ForwardID: "fwd-a", Port: portA, TargetHost: "127.0.0.1", TargetPort: tcpSink, TCP: true, UDP: true, AllowPrivate: true}},
+	); err != nil {
+		t.Fatalf("applyAll legacy->forwards: %v", err)
+	}
+	relayEng.mu.Lock()
+	if h := relayEng.handles[relayForwardKey("fwd-a")]; h == nil || h.err != "" {
+		relayEng.mu.Unlock()
+		t.Fatalf("forward portA after legacy->forwards failed: %+v", h)
+	}
+	relayEng.mu.Unlock()
+
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(portA))
+	if err != nil {
+		t.Fatalf("dial swapped portA: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	echoThrough(t, conn, "swapped")
+}
+
+// 回归：TCP+UDP 转发只有一侧打开失败时，必须立刻关闭另一侧半开监听，不留孤立端口占用。
+func TestRelayHalfOpenCleanedOnPartialBindFailure(t *testing.T) {
+	resetRelay(t.TempDir())
+	t.Cleanup(relayStop)
+
+	heldUDP, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = heldUDP.Close() })
+	port := heldUDP.LocalAddr().(*net.UDPAddr).Port
+	sink := echoSink(t)
+
+	if err := relayEng.apply([]relaySpec{
+		{Port: port, TargetHost: "127.0.0.1", TargetPort: sink, TCP: true, UDP: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	relayEng.mu.Lock()
+	h := relayEng.handles[relayPortKey(port)]
+	if h == nil || h.err == "" {
+		relayEng.mu.Unlock()
+		t.Fatalf("expected UDP bind failure on port %d, got %+v", port, h)
+	}
+	if h.tcp != nil || h.udp != nil {
+		relayEng.mu.Unlock()
+		t.Fatalf("failed handle kept half-open socket: tcp=%v udp=%v", h.tcp, h.udp)
+	}
+	relayEng.mu.Unlock()
+
+	// TCP 端口未被失败条目半开占住，应可被正常监听。
+	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("TCP port %d was leaked by failed TCP+UDP relay: %v", port, err)
+	}
+	_ = ln.Close()
+}
+
+func freeDualRelayPort(t *testing.T) int {
+	t.Helper()
+	for range 32 {
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		pc, uerr := net.ListenPacket("udp", ":"+strconv.Itoa(port))
+		_ = ln.Close()
+		if uerr == nil {
+			_ = pc.Close()
+			return port
+		}
+	}
+	t.Fatal("could not allocate free dual relay port")
+	return 0
+}

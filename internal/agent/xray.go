@@ -333,6 +333,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 		// 停核心前补一次用量：relay 已先按新清单撤销，转发尾量不会拖到下一账期。
 		_ = reportStatsLocked(ctx, s)
 		stopLocked()
+		// 核心释放端口后立刻重试此前打开失败的转发条目（如端口从业务切到转发）。
+		relayRetryFailed()
 		proc.applied = nil
 		proc.skeleton = ""
 		_ = os.Remove(filepath.Join(s.cfg.DataDir, "applied-skeleton"))
@@ -449,6 +451,8 @@ func (s *session) applyDesired(ctx context.Context, raw json.RawMessage) error {
 			}
 		}
 	}
+	// 核心配置应用完成后立刻重试此前短暂冲突的转发端口，避免拖到下一次 15s 心跳。
+	relayRetryFailed()
 	return writeGeneration(s.cfg.DataDir, body.Generation)
 }
 
